@@ -70,6 +70,7 @@ _MOIS_FR = {
     "July": "Juillet", "August": "Aout", "September": "Septembre",
     "October": "Octobre", "November": "Novembre", "December": "Decembre",
 }
+
 def _scout_css():
     return """
 <style>
@@ -697,6 +698,7 @@ if answer_togg:
             #    st.button("Autres News", key="open_theme_autres_disabled", width="stretch", disabled=True)
             #st.markdown("</div>", unsafe_allow_html=True)
             #st.markdown("</div>", unsafe_allow_html=True)
+            st.markdown("<br>", unsafe_allow_html=True)
 
 else:
     #st.markdown("<div class='thick-divider'></div>", unsafe_allow_html=True)
