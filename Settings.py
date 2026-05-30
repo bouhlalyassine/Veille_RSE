@@ -2015,7 +2015,7 @@ except Exception:
 # Bumper cette version a chaque modification de la taxonomie (themes, keywords, sources).
 # Inclus dans le slot de cache -> invalide automatiquement le DataFrame en cache et
 # force un re-scraping a la prochaine execution.
-_TAXONOMY_VERSION = "v22"
+_TAXONOMY_VERSION = "v23"
 
 
 def current_cache_slot() -> str:
@@ -2135,6 +2135,12 @@ def data_media_scout(urls=None, slot: str = ""):
     df = df.drop_duplicates(subset=["_link_key"])
     df = df.drop_duplicates(subset=["_title_key"])
     df = df.drop(columns=["_title_key", "_link_key"])
+
+    # Traduction FR des articles non-francophones (sources institutionnelles EN :
+    # EFSA, DairyReporter, Climate Home, etc.). ~4% des articles. Batched + cache
+    # via le slot. Garantit que TOUS les resumes affiches sont en francais.
+    df = _translate_articles_to_french(df)
+
     df["Theme"] = pd.Categorical(df["Theme"], categories=MEDIA_SCOUT_THEMES, ordered=True)
     df["Veille"] = pd.Categorical(df["Veille"], categories=MEDIA_SCOUT_VEILLES, ordered=True)
     df = df.sort_values(["Veille", "Theme", "Date"], ascending=[True, True, False])
@@ -2639,6 +2645,90 @@ def _force_french_translate(text: str, kind: str = "phrase") -> str:
     except Exception:
         pass
     return text
+
+
+# Taille de lot pour la traduction batchee des articles (token budget)
+_TRANSLATE_CHUNK_SIZE = 12
+
+
+def _translate_articles_to_french(df):
+    """Traduit en francais le Titre + Description des articles non-francophones.
+
+    N'agit que sur les lignes dont le titre OU la description n'est pas deja en
+    francais (sources institutionnelles EN : EFSA, DairyReporter, Climate Home,
+    Carbon Brief, Fairtrade, etc. — environ 4% du corpus). Traduction par lots
+    pour limiter le nombre d'appels LLM. Mis en cache via data_media_scout (slot).
+
+    Fail-safe : sur erreur LLM (rate limit, JSON casse), garde le texte original.
+    """
+    if not _has_any_llm_key() or df.empty:
+        return df
+
+    # Identifie les lignes a traduire (titre OU description non-FR)
+    todo = []
+    for idx, row in df.iterrows():
+        title = str(row.get("Title", ""))
+        desc = str(row.get("Description", ""))
+        title_non_fr = bool(title) and not _looks_french(title)
+        desc_non_fr = len(desc) > 30 and not _looks_french(desc)
+        if title_non_fr or desc_non_fr:
+            todo.append((idx, title, desc))
+
+    if not todo:
+        return df
+
+    for start in range(0, len(todo), _TRANSLATE_CHUNK_SIZE):
+        chunk = todo[start:start + _TRANSLATE_CHUNK_SIZE]
+        # Construit la liste numerotee a traduire
+        listed = "\n".join(
+            f"[{i}] TITRE: {t[:200]}\n    RESUME: {d[:400]}"
+            for i, (_, t, d) in enumerate(chunk)
+        )
+        prompt = (
+            "Traduis en FRANCAIS correct le titre et le resume de chaque article "
+            "ci-dessous. Conserve le sens et les chiffres. Si un champ est deja en "
+            "francais, reformule-le legerement. Acronymes (ISO, RSE, EFSA, UE...) "
+            "inchanges.\n\n"
+            f"{listed}\n\n"
+            "Reponds UNIQUEMENT en JSON strict, sans markdown :\n"
+            '{"articles":[{"i":<num>,"titre":"<titre FR>","resume":"<resume FR>"}, ...]}'
+        )
+        try:
+            resp = _llm_chat_with_failover(
+                messages=[
+                    {"role": "system", "content": "Tu es un traducteur professionnel vers le francais. Tu rends UNIQUEMENT du francais correct."},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=1800,
+                temperature=0.2,
+            )
+            raw = (resp.choices[0].message.content or "").strip()
+            if raw.startswith("```"):
+                raw = re.sub(r"^```(?:json)?\s*", "", raw)
+                raw = re.sub(r"\s*```$", "", raw)
+            mm = re.search(r"\{[\s\S]*\}", raw)
+            if mm:
+                raw = mm.group(0)
+            data = json.loads(raw)
+            for art in data.get("articles", []):
+                try:
+                    i = int(art.get("i"))
+                except (TypeError, ValueError):
+                    continue
+                if not (0 <= i < len(chunk)):
+                    continue
+                df_idx = chunk[i][0]
+                titre_fr = str(art.get("titre", "")).strip()
+                resume_fr = str(art.get("resume", "")).strip()
+                if titre_fr:
+                    df.loc[df_idx, "Title"] = titre_fr
+                if resume_fr:
+                    df.loc[df_idx, "Description"] = resume_fr
+        except Exception:
+            # Fail-safe : on garde les textes originaux de ce lot
+            continue
+
+    return df
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
