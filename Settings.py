@@ -1,26 +1,34 @@
 import base64
-import json
-import os
-from pathlib import Path
-import requests
-import streamlit as st
-import streamlit_authenticator as stauth
-import yaml
-from yaml.loader import SafeLoader
 import html
+import json
 import os
 import re
 import unicodedata
 import warnings
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
+from functools import lru_cache
+from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import urljoin, urlparse
 from xml.etree import ElementTree
+from zoneinfo import ZoneInfo
+
 import pandas as pd
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 from groq import Groq
+
+try:
+    from google import genai as _genai  # SDK google-genai (>=2.x)
+    from google.genai import types as _genai_types
+    _GENAI_AVAILABLE = True
+except Exception:  # pragma: no cover - lib non installee
+    _genai = None
+    _genai_types = None
+    _GENAI_AVAILABLE = False
 
 try:
     from bs4 import MarkupResemblesLocatorWarning
@@ -30,15 +38,7 @@ except ImportError:
 
 
 current_dir = Path(__file__).parent if "__file__" in locals() else Path.cwd()
-TITLE = "Taskforce IA"
-
-config_APP = current_dir / "files" / "hash_APP.yaml"
 css_file = current_dir / "main.css"
-
-img_logo_name_ico = current_dir / "files" / "logo_name.png"
-img_logo_ico = str(img_logo_name_ico) if img_logo_name_ico.exists() else None
-lottie_warning = current_dir / "files" / "warning.json"
-lottie_robot = current_dir / "files" / "AI_Robot.json"
 
 
 def get_base64_of_bin_file(bin_file):
@@ -46,207 +46,387 @@ def get_base64_of_bin_file(bin_file):
         return base64.b64encode(f.read()).decode()
 
 
-def get_img(local_img_path, width):
-    local_img_path = str(local_img_path)
-    img_format = os.path.splitext(local_img_path)[-1].replace(".", "").lower()
-    bin_str = get_base64_of_bin_file(local_img_path)
-    return f"""
-        <div style='display:flex; justify-content:center; align-items:center;'>
-            <img src='data:image/{img_format};base64,{bin_str}' width='{width}'>
-        </div>
-    """
-
-
-def load_lottiefile(filepath):
-    with open(filepath, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def load_lottieurl(url):
-    response = requests.get(url, timeout=10)
-    if response.status_code != 200:
-        return None
-    return response.json()
-
-
 def load_css():
-    with open(css_file, encoding="utf-8") as f:
-        st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
-
-
-def load_auth_config():
-    with open(config_APP, encoding="utf-8") as file:
-        return yaml.load(file, Loader=SafeLoader)
-
-
-def build_authenticator(config):
-    return stauth.Authenticate(
-        config["credentials"],
-        config["cookie"]["name"],
-        config["cookie"]["key"],
-        config["cookie"]["expiry_days"],
-        config["preauthorized"],
-    )
-
-
-def require_authenticated_user():
-    config = load_auth_config()
-    authenticator = build_authenticator(config)
-    load_css()
-
-    name, authentication_status, username = authenticator.login("Login", "main")
-    users = config["credentials"]["usernames"]
-
-    if authentication_status is False:
-        st.error("Username/password is incorrect")
-        st.stop()
-
-    if authentication_status is None:
-        st.warning("Please enter your username and password")
-        st.stop()
-
-    if username not in users:
-        st.warning("Vous n'avez pas acces a ce module")
-        st.stop()
-
-    return authenticator, name, username
+    if css_file.exists():
+        with open(css_file, encoding="utf-8") as f:
+            st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
 
 
 
-
-
-MEDIA_SCOUT_ALLOWED_THEMES = [
-    "RSE & Referentiels",
-    "Eau",
-    "Energie",
-    "Environnement",
-    "Autres",
+MEDIA_SCOUT_THEMES = [
+    "Agrumes, Fruits rouges & Maraichage",
+    "Elevage (Ovins, Bovins, Caprins, Volailles)",
+    "Produits laitiers & Epicerie fine",
+    "Environnement, Eau & Energie",
+    "ESG, QSE & SST",
 ]
 
+MEDIA_SCOUT_THEME_EMOJI = {
+    "Agrumes, Fruits rouges & Maraichage":           "🍊",
+    "Elevage (Ovins, Bovins, Caprins, Volailles)":   "🐄",
+    "Produits laitiers & Epicerie fine":             "🧀",
+    "Environnement, Eau & Energie":                  "🌍",
+    "ESG, QSE & SST":                                "🏛️",
+}
+
+MEDIA_SCOUT_VEILLES = [
+    "Veille Reglementaire",
+    "Veille Informative",
+    "Veille Evenementielle",
+    "Veille Concurrentielle",
+]
+
+MEDIA_SCOUT_VEILLE_EMOJI = {
+    "Veille Reglementaire":   "⚖️",
+    "Veille Informative":     "📰",
+    "Veille Evenementielle":  "📅",
+    "Veille Concurrentielle": "🎯",
+}
+
 MEDIA_SCOUT_SOURCE_CATALOG = [
-    {"Journal": "AgriMaroc", "URL": "https://www.agrimaroc.ma/actualite-agricole/", "Couverture": "Maroc - eau, climat, agriculture durable"},
-    {"Journal": "EcoActu", "URL": "https://ecoactu.ma/developpement-durable/", "Couverture": "Maroc - developpement durable, environnement, RSE"},
-    {"Journal": "FNH - Finances News Hebdo", "URL": "https://fnh.ma/articles/developpement-durable", "Couverture": "Maroc - developpement durable, RSE"},
-    {"Journal": "CGEM", "URL": "https://cgem.ma/actualites/", "Couverture": "Maroc - entreprises, RSE, climat des affaires"},
-    {"Journal": "Le360", "URL": "https://fr.le360.ma/economie/", "Couverture": "Maroc - economie filtree energie/RSE/environnement"},
-    {"Journal": "Le Vert", "URL": "https://levert.ma/category/transition-energetique/", "Couverture": "Maroc - transition energetique"},
-    {"Journal": "Le Vert", "URL": "https://levert.ma/category/developpement-durable/", "Couverture": "Maroc - developpement durable"},
-    {"Journal": "Medias24", "URL": "https://medias24.com/categorie/environnement/", "Couverture": "Maroc - environnement"},
-    {"Journal": "MAP News", "URL": "https://www.mapnews.ma/fr/actualites/economie", "Couverture": "Maroc - institutions, energie, environnement"},
-    {"Journal": "Ministere Transition Energetique", "URL": "https://www.mem.gov.ma/Pages/actualites.aspx", "Couverture": "Maroc - energie, mines, transition"},
-    {"Journal": "Ministere Equipement et Eau", "URL": "https://www.equipement.gov.ma/Actualites/Pages/Actualites.aspx", "Couverture": "Maroc - eau, barrages, infrastructures"},
-    {"Journal": "Departement Environnement", "URL": "https://www.environnement.gov.ma/fr/actualites", "Couverture": "Maroc - environnement, climat"},
-    {"Journal": "Actu-Environnement", "URL": "https://www.actu-environnement.com/actualites/", "Couverture": "France/International - eau, energie, environnement, RSE"},
-    {"Journal": "Novethic", "URL": "https://www.novethic.fr/actualite/rse", "Couverture": "France/Europe - RSE, CSRD, finance durable"},
-    {"Journal": "UN Global Compact", "URL": "https://unglobalcompact.org/news", "Couverture": "Officiel - RSE, droits humains, anti-corruption, SDGs, Communication on Progress"},
-    {"Journal": "OECD RBC", "URL": "https://www.oecd.org/en/topics/responsible-business-conduct.html", "Couverture": "Officiel - conduite responsable, devoir de vigilance, lignes directrices OCDE"},
-    {"Journal": "ISO News", "URL": "https://www.iso.org/news.html", "Couverture": "Officiel - normes ISO, durabilite, ISO 26000, ISO 14001"},
-    {"Journal": "ISO 26000", "URL": "https://www.iso.org/iso-26000-social-responsibility.html", "Couverture": "Officiel - responsabilite societale, ISO 26000"},
-    {"Journal": "ISO 14001", "URL": "https://www.iso.org/standard/14001", "Couverture": "Officiel - ISO 14001, systeme de management environnemental, dechets, performance environnementale"},
-    {"Journal": "ISO 14000 Family", "URL": "https://www.iso.org/iso-14001-environmental-management.html", "Couverture": "Officiel - famille ISO 14000, ISO 14001, management environnemental, dechets"},
-    {"Journal": "AFNOR ISO 14001", "URL": "https://www.afnor.org/actualites/protection-environnement/nouvelle-norme-iso-14001/", "Couverture": "France - ISO 14001 version 2026, management environnemental, dechets, cycle de vie"},
-    {"Journal": "AFNOR Certification ISO 14001", "URL": "https://certification.afnor.org/environnement/certification-afaq-iso-14001", "Couverture": "France - certification ISO 14001, performance environnementale, recyclage, valorisation des dechets"},
-    {"Journal": "EU EMAS", "URL": "https://green-business.ec.europa.eu/eco-management-and-audit-scheme-emas_en", "Couverture": "Officiel UE - EMAS, management environnemental, audit, reporting environnemental"},
-    {"Journal": "Basel Convention", "URL": "https://www.basel.int/Implementation/Publications/LatestNews/tabid/2310/Default.aspx", "Couverture": "Officiel - dechets dangereux, conventions internationales, mouvements transfrontieres de dechets"},
-    {"Journal": "Ellen MacArthur Foundation", "URL": "https://www.ellenmacarthurfoundation.org/news", "Couverture": "International - economie circulaire, dechets, referentiels et cadres circularite"},
-    {"Journal": "B Lab Global", "URL": "https://www.bcorporation.net/en-us/news/", "Couverture": "Officiel - B Corp, standards B Lab, entreprises a impact"},
-    {"Journal": "B Lab Standards", "URL": "https://www.bcorporation.net/en-us/standards/", "Couverture": "Officiel - referentiel B Corp, standards sociaux/environnementaux/gouvernance"},
-    {"Journal": "EcoVadis", "URL": "https://ecovadis.com/newsroom/", "Couverture": "International - notation RSE, achats responsables, supply chain ESG"},
-    {"Journal": "PRI", "URL": "https://public.unpri.org/news-and-press", "Couverture": "Officiel - investissement responsable, ESG, stewardship"},
-    {"Journal": "AMMC Finance Durable", "URL": "https://www.ammc.ma/fr/node/45550", "Couverture": "Maroc - finance durable, reporting ESG, marches de capitaux"},
-    {"Journal": "GRI", "URL": "https://www.globalreporting.org/news/news-center/", "Couverture": "Officiel - GRI Standards"},
-    {"Journal": "EFRAG", "URL": "https://www.efrag.org/en/news-and-calendar/news", "Couverture": "Officiel - CSRD, ESRS"},
-    {"Journal": "IFRS / ISSB", "URL": "https://www.ifrs.org/news-and-events/updates/issb/", "Couverture": "Officiel - IFRS S1/S2, ISSB"},
-    {"Journal": "IFRS / SASB", "URL": "https://www.ifrs.org/issued-standards/sasb-standards/", "Couverture": "Officiel - SASB Standards, IFRS S1/S2, reporting sectoriel"},
-    {"Journal": "ESMA Sustainable Finance", "URL": "https://www.esma.europa.eu/press-news/esma-news", "Couverture": "Officiel UE - finance durable, ESG, supervision, reporting"},
-    {"Journal": "European Commission Sustainable Finance", "URL": "https://finance.ec.europa.eu/sustainable-finance_en", "Couverture": "Officiel UE - taxonomie, CSRD, finance durable, SFDR"},
-    {"Journal": "TNFD", "URL": "https://tnfd.global/news/", "Couverture": "Officiel - nature, biodiversite"},
-    {"Journal": "SBTi", "URL": "https://sciencebasedtargets.org/news", "Couverture": "Officiel - climat, objectifs SBT"},
-    {"Journal": "CDP", "URL": "https://www.cdp.net/en/articles", "Couverture": "Officiel - reporting climat/eau/forets"},
-    {"Journal": "GHG Protocol", "URL": "https://ghgprotocol.org/blog-type/press-release", "Couverture": "Officiel - comptabilite carbone, Scope 1/2/3"},
-    {"Journal": "UNEP", "URL": "https://www.unep.org/news-and-stories", "Couverture": "International - environnement, climat, biodiversite"},
-    {"Journal": "WRI", "URL": "https://www.wri.org/news", "Couverture": "International - climat, ressources, eau, energie"},
-    {"Journal": "IEA", "URL": "https://www.iea.org/news", "Couverture": "International - energie, transition energetique"},
-    {"Journal": "IRENA", "URL": "https://www.irena.org/News", "Couverture": "International - energies renouvelables"},
-    {"Journal": "MAP Ecology", "URL": "https://mapecology.ma/", "Couverture": "Maroc - ecologie, environnement, climat"},
-    {"Journal": "Le Matin", "URL": "https://lematin.ma/economie", "Couverture": "Maroc - climat, eau, energie, transition"},
+    # ─── MAROC ─────────────────────────────────────────────────────────────────
+    # NB: sources retirees car injoignables/SPA (404, SSL, JS) : FNH, CGEM,
+    # Medias24, ministeres (Agriculture/Sante/Transition Energ.), Dept Env,
+    # IMANOR, AMMC. Leur contenu est desormais capte via les flux Google News
+    # RSS reglementaires/institutionnels MA (cf. section dediee plus bas).
+    {"Journal": "AgriMaroc", "URL": "https://www.agrimaroc.ma/actualite-agricole/", "Couverture": "Eau, climat, agriculture durable"},
+    {"Journal": "Le Vert", "URL": "https://levert.ma/category/transition-energetique/", "Couverture": "Transition energetique"},
+    {"Journal": "Le Vert - Developpement Durable", "URL": "https://levert.ma/category/developpement-durable/", "Couverture": "Developpement durable"},
+    {"Journal": "MAP Ecology", "URL": "https://mapecology.ma/", "Couverture": "Ecologie, environnement, climat"},
+    {"Journal": "Ministere Equipement et Eau", "URL": "https://www.equipement.gov.ma/Actualites/Pages/Actualites.aspx", "Couverture": "Eau, barrages, infrastructures"},
+    {"Journal": "ONSSA", "URL": "https://www.onssa.gov.ma/actualites/", "Couverture": "Securite sanitaire des aliments, normes alimentaires"},
+
+    # ─── UE - Reglementation alimentaire & EFSA (impact direct exports Maroc) ──
+    {"Journal": "EFSA", "URL": "https://www.efsa.europa.eu/en/news", "Couverture": "Securite alimentaire europeenne, EFSA"},
+    {"Journal": "DG SANTE EU - Food", "URL": "https://food.ec.europa.eu/news_en", "Couverture": "Politique alimentaire, food safety, regulations"},
+
+    # ─── UE - ESG / QSE / SST (normes & directives impactant Maroc) ────────────
+    # NB: retires car injoignables/SPA/0-article : Actu-Environnement (404),
+    # EU-OSHA, EU Health News (403), Novethic (SPA), Commission EU Finance
+    # Durable (SPA). Couverture normes/RSE/SST desormais via Google News RSS.
+    {"Journal": "AFNOR Actualites", "URL": "https://www.afnor.org/actualites/", "Couverture": "Normes, certification, AFNOR (influence ISO)"},
+    {"Journal": "EU EMAS", "URL": "https://green-business.ec.europa.eu/eco-management-and-audit-scheme-emas_en", "Couverture": "EMAS, management environnemental"},
+    {"Journal": "EFRAG", "URL": "https://www.efrag.org/en/news-and-calendar/news", "Couverture": "CSRD, ESRS"},
+
+    # ─── UE - Food industry / FMCG (couverture globale, pas locale) ────────────
+    {"Journal": "Food Navigator", "URL": "https://www.foodnavigator.com/", "Couverture": "Food trends (global), FMCG, retail"},
+
+    # ─── WORLD - Agriculture ───────────────────────────────────────────────────
+    # NB: Codex (404) et GlobalG.A.P. (404) retires -> repris via Google News RSS normes.
+    {"Journal": "FAO Newsroom", "URL": "https://www.fao.org/newsroom/en", "Couverture": "Agriculture, alimentation, securite alimentaire"},
+
+    # ─── CONCURRENTS LDA — Sites corporates (HTML pages presse) ────────────────
+    # Note: la majorite des sites corporates sont des SPA JS non scrapables
+    # (Groupe Bel, Ribambel, Nestlé MENA, Aïcha retires) — leurs marques sont
+    # couvertes par les flux Google News RSS ci-dessous. On garde seulement
+    # Lesieur Cristal (HTML statique avec contenu).
+    {"Journal": "Lesieur Cristal",  "URL": "https://lesieur-cristal.com/communication_financiere/communiques-de-presse/", "Couverture": "Concurrent epicerie fine Maroc — Huiles, condiments (CP financiers)"},
+
+    # ─── CONCURRENTS LDA — Google News RSS (one per cluster) ───────────────────
+    # Feeds RSS XML standard, ultra-fiables. Chaque feed cible une marque ou un
+    # cluster de marques concurrentes via une recherche Google News dediee.
+    # Le scraper RSS extrait titre + date (pubDate) + lien (URL wrappee Google).
+    {"Journal": "GNews — Centrale Danone",   "URL": "https://news.google.com/rss/search?q=%22Centrale+Danone%22&hl=fr&gl=MA&ceid=MA:fr",                                                "Couverture": "Concurrent laitier MA — Centrale Danone Maroc (presse agregee)"},
+    {"Journal": "GNews — COPAG Jaouda",      "URL": "https://news.google.com/rss/search?q=%22COPAG%22+OR+%22Jaouda%22&hl=fr&gl=MA&ceid=MA:fr",                                          "Couverture": "Concurrent laitier MA — COPAG / Jaouda (presse agregee)"},
+    {"Journal": "GNews — Lesieur Cristal",   "URL": "https://news.google.com/rss/search?q=%22Lesieur+Cristal%22&hl=fr&gl=MA&ceid=MA:fr",                                                "Couverture": "Concurrent epicerie fine MA — Lesieur Cristal (presse agregee)"},
+    {"Journal": "GNews — Marjane Maroc",     "URL": "https://news.google.com/rss/search?q=%22Marjane+Group%22+OR+%22Marjane+Maroc%22+OR+%22Carrefour+Maroc%22+OR+%22Label+Vie%22&hl=fr&gl=MA&ceid=MA:fr", "Couverture": "Concurrent distrib MA — Marjane, Carrefour, Label Vie, BIM (MDD)"},
+    {"Journal": "GNews — Bel Maroc",         "URL": "https://news.google.com/rss/search?q=%22Vache+qui+rit%22+OR+%22Kiri%22+OR+%22Babybel%22+OR+%22Groupe+Bel%22&hl=fr&gl=MA&ceid=MA:fr",  "Couverture": "Concurrent laitier — Bel (Vache qui rit, Kiri, Babybel)"},
+    {"Journal": "GNews — Lactalis",          "URL": "https://news.google.com/rss/search?q=%22Lactalis%22+OR+%22President+fromage%22+OR+%22Lactel%22+OR+%22Galbani%22&hl=fr&ceid=:fr",     "Couverture": "Concurrent laitier — Lactalis (President, Lactel, Galbani)"},
+    {"Journal": "GNews — Savencia",          "URL": "https://news.google.com/rss/search?q=%22Savencia%22+OR+%22Caprice+des+Dieux%22+OR+%22Saint+Albray%22+OR+%22Elle+%26+Vire%22&hl=fr&ceid=:fr", "Couverture": "Concurrent laitier — Savencia (Caprice des Dieux, Saint Albray, Elle&Vire)"},
+    {"Journal": "GNews — Bonne Maman Andros","URL": "https://news.google.com/rss/search?q=%22Bonne+Maman%22+OR+%22Andros+confiture%22+OR+%22Andros+groupe%22&hl=fr&ceid=:fr",            "Couverture": "Concurrent epicerie fine — Bonne Maman, Andros (confitures)"},
+    {"Journal": "GNews — Hero St Dalfour",   "URL": "https://news.google.com/rss/search?q=%22Hero+confiture%22+OR+%22Hero+Group%22+OR+%22St+Dalfour%22+OR+%22St.+Dalfour%22&hl=fr&ceid=:fr",  "Couverture": "Concurrent epicerie fine — Hero, St. Dalfour (confitures premium)"},
+    {"Journal": "GNews — Olive MA",          "URL": "https://news.google.com/rss/search?q=%22Cartier+Saada%22+OR+%22Zouitina%22+OR+%22Diana+Holding%22+OR+%22CaracTerre%22&hl=fr&gl=MA&ceid=MA:fr", "Couverture": "Concurrent epicerie fine MA — Cartier Saada, Zouitina, Diana Holding"},
+    {"Journal": "GNews — Sovena Puget",      "URL": "https://news.google.com/rss/search?q=%22Sovena%22+OR+%22Oliveira+da+Serra%22+OR+%22Puget+huile%22+OR+%22Puget+olive%22&hl=fr&ceid=:fr", "Couverture": "Concurrent epicerie fine — Sovena, Oliveira da Serra, Puget (huiles d'olive)"},
+
+    # ─── PRESSE ÉCONOMIQUE MAROC (RSS) — couverture multi-secteurs ─────────────
+    # Articles concurrentiels detectes via mention explicite de marque LDA
+    # (_LDA_COMPETITORS) — pas auto-classes T3. Le filtre post-scrape decide.
+    {"Journal": "EcoActu",          "URL": "https://www.ecoactu.ma/feed/",       "Couverture": "Presse economique Maroc — entreprises, distribution, agro"},
+    {"Journal": "Aujourd'hui Maroc","URL": "https://aujourdhui.ma/feed",         "Couverture": "Presse generaliste Maroc — economie, societe"},
+    {"Journal": "Challenge.ma",     "URL": "https://www.challenge.ma/feed/",     "Couverture": "Presse economique Maroc — affaires, entreprises"},
+    {"Journal": "Financial Afrik",  "URL": "https://www.financialafrik.com/feed/", "Couverture": "Presse economique Afrique — agro, FMCG, distribution"},
+
+    # ─── WORLD - Elevage (ovin/bovin/caprin/volaille) ──────────────────────────
+    # NB: Poultry World (SPA) retire -> aviculture couverte par GNews Aviculture MA.
+    {"Journal": "WOAH (OIE)",   "URL": "https://www.woah.org/en/news/",       "Couverture": "Sante animale, elevage, epizooties"},
+    {"Journal": "DairyReporter","URL": "https://www.dairyreporter.com/",      "Couverture": "Filiere laitiere mondiale"},
+    # AgriMaroc - section dediee elevage (en plus de la categorie generale)
+    {"Journal": "AgriMaroc Élevage", "URL": "https://www.agrimaroc.ma/category/elevage/", "Couverture": "Elevage Maroc — ovins, bovins, caprins, volailles"},
+
+    # ─── Google News RSS — Elevage Maroc (BÉTAIL strict) ───────────────────────
+    # Queries focalisees STRICTEMENT sur les especes betail (ovin/bovin/caprin/
+    # volaille) pour eviter les faux positifs (ex: "éleveurs d'olives", "élevé"
+    # adjectif). On evite les termes generiques "elevage" / "eleveur" qui
+    # peuvent matcher des contextes non-livestock.
+    {"Journal": "GNews — Bétail MA",       "URL": "https://news.google.com/rss/search?q=(%22mouton%22+OR+%22ovin%22+OR+%22bovin%22+OR+%22caprin%22+OR+%22vache+laitiere%22+OR+%22cheptel%22+OR+%22betail%22)+Maroc&hl=fr&gl=MA&ceid=MA:fr", "Couverture": "Elevage MA — Bétail (ovins, bovins, caprins, cheptel)"},
+    {"Journal": "GNews — Aviculture MA",    "URL": "https://news.google.com/rss/search?q=(%22aviculture%22+OR+%22filiere+avicole%22+OR+%22poulet%22+OR+%22volaille%22+OR+%22dinde%22)+Maroc&hl=fr&gl=MA&ceid=MA:fr",  "Couverture": "Elevage MA — Aviculture, volaille, poulet, dinde"},
+    {"Journal": "GNews — Viande MA",       "URL": "https://news.google.com/rss/search?q=(%22filiere+viande%22+OR+%22viande+ovine%22+OR+%22viande+bovine%22+OR+%22abattoir%22+OR+%22marche+ovin%22)+Maroc&hl=fr&gl=MA&ceid=MA:fr", "Couverture": "Elevage MA — Filiere viande, abattoirs, marche ovin"},
+    {"Journal": "GNews — ANOC FIVOB",       "URL": "https://news.google.com/rss/search?q=(%22ANOC%22+OR+%22FIVOB%22+OR+%22FISA%22+OR+%22FIMABE%22+OR+%22INTERPROVI%22)+Maroc&hl=fr&gl=MA&ceid=MA:fr",                    "Couverture": "Elevage MA — Federations interprofessionnelles betail"},
+    {"Journal": "GNews — Lait Maroc",       "URL": "https://news.google.com/rss/search?q=(%22filiere+laitiere%22+OR+%22production+laitiere%22+OR+%22vache+laitiere%22+OR+%22centres+collecte+lait%22)+Maroc&hl=fr&gl=MA&ceid=MA:fr",  "Couverture": "Elevage MA — Filiere laitiere, vaches laitieres"},
+
+    # ─── WORLD - Environnement / Climat / Energie ──────────────────────────────
+    # NB: retires car SPA/404/502 (0 article) : UNEP, WRI, TNFD, SBTi, CDP,
+    # GHG Protocol, IRENA, Energy Voice, Basel Convention. Couverture climat/eau/
+    # energie desormais via Google News RSS (section dediee ci-dessous).
+    {"Journal": "Climate Home News", "URL": "https://www.climatechangenews.com/feed/", "Couverture": "Politique climatique"},
+    {"Journal": "Carbon Brief", "URL": "https://www.carbonbrief.org/feed", "Couverture": "Science climatique, donnees"},
+
+    # ─── WORLD - ESG / QSE / SST / QVT ─────────────────────────────────────────
+    # NB: retires car SPA/404/403 (0 article) : OECD RBC, ISO (x4), EcoVadis,
+    # GRI, IFRS (x2), ESG Investor, Env Finance, PRI, ILO, OSHA US, WHO, Sedex,
+    # BRCGS, IFS Food, FSSC 22000. Normes/RSE/QSE/SST captees via Google News RSS.
+    {"Journal": "UN Global Compact", "URL": "https://unglobalcompact.org/news", "Couverture": "RSE, droits humains, SDGs"},
+    {"Journal": "FDA News", "URL": "https://www.fda.gov/news-events/fda-newsroom", "Couverture": "FDA, normes alimentaires/pharma"},
+    {"Journal": "Fairtrade International", "URL": "https://www.fairtrade.net/news", "Couverture": "Fairtrade, commerce equitable"},
+
+    # ═══ GOOGLE NEWS RSS — BACKFILL T4 (Environnement) & T5 (Normes) ═══════════
+    # Remplace les sources institutionnelles SPA/injoignables par des flux RSS
+    # fiables (testes). Themes forces via MEDIA_SCOUT_FORCED_SOURCE_THEMES.
+    # ── T4 : Environnement, Eau & Energie ──
+    {"Journal": "GNews — Eau Maroc",        "URL": "https://news.google.com/rss/search?q=(%22stress+hydrique%22+OR+%22barrage%22+OR+%22ressources+en+eau%22+OR+%22dessalement%22+OR+%22penurie+d%27eau%22)+Maroc&hl=fr&gl=MA&ceid=MA:fr", "Couverture": "T4 — Eau, barrages, stress hydrique Maroc"},
+    {"Journal": "GNews — Energie Maroc",    "URL": "https://news.google.com/rss/search?q=(%22energie+renouvelable%22+OR+%22solaire%22+OR+%22eolien%22+OR+%22hydrogene+vert%22+OR+%22transition+energetique%22)+Maroc&hl=fr&gl=MA&ceid=MA:fr", "Couverture": "T4 — Energies renouvelables, transition energetique Maroc"},
+    {"Journal": "GNews — Climat Maroc",     "URL": "https://news.google.com/rss/search?q=(%22changement+climatique%22+OR+%22secheresse%22+OR+%22climat%22+OR+%22carbone%22+OR+%22biodiversite%22)+Maroc+agriculture&hl=fr&gl=MA&ceid=MA:fr", "Couverture": "T4 — Climat, secheresse, carbone, biodiversite Maroc"},
+    # ── T5 : Normes : ESG, QSE & SST ──
+    {"Journal": "GNews — Normes RSE",       "URL": "https://news.google.com/rss/search?q=(%22CSRD%22+OR+%22reporting+extra-financier%22+OR+%22norme+ISO%22+OR+%22ISO+14001%22+OR+%22ISO+26000%22+OR+%22RSE%22)+entreprise&hl=fr&ceid=:fr", "Couverture": "T5 — RSE, CSRD, normes ISO, reporting durable"},
+    {"Journal": "GNews — Securite alimentaire", "URL": "https://news.google.com/rss/search?q=(%22securite+alimentaire%22+OR+%22HACCP%22+OR+%22FSSC+22000%22+OR+%22IFS+Food%22+OR+%22BRCGS%22+OR+%22certification+halal%22)&hl=fr&ceid=:fr", "Couverture": "T5 — Securite alimentaire, HACCP, certifications agro"},
+    {"Journal": "GNews — QSE SST Maroc",    "URL": "https://news.google.com/rss/search?q=(%22sante+securite+au+travail%22+OR+%22ISO+45001%22+OR+%22accident+du+travail%22+OR+%22QHSE%22+OR+%22audit+social%22)+Maroc&hl=fr&gl=MA&ceid=MA:fr", "Couverture": "T5 — QSE, SST, ISO 45001, audit social Maroc"},
+    {"Journal": "GNews — Gouvernance ESG MA", "URL": "https://news.google.com/rss/search?q=(%22gouvernance%22+OR+%22ESG%22+OR+%22developpement+durable%22+OR+%22AMMC%22+OR+%22CGEM%22)+entreprise+Maroc&hl=fr&gl=MA&ceid=MA:fr", "Couverture": "T5 — Gouvernance, ESG, AMMC, CGEM Maroc"},
+
 ]
 
 MEDIA_SCOUT_URLS = [source["URL"] for source in MEDIA_SCOUT_SOURCE_CATALOG]
 MEDIA_SCOUT_URL_TO_NAME = {source["URL"]: source["Journal"] for source in MEDIA_SCOUT_SOURCE_CATALOG}
 
-MEDIA_SCOUT_REFERENTIAL_SOURCE_DOMAINS = [
-    "globalreporting.org",
-    "efrag.org",
-    "ifrs.org",
-    "tnfd.global",
-    "cdp.net",
-    "sciencebasedtargets.org",
-    "ghgprotocol.org",
-    "unglobalcompact.org",
-    "oecd.org",
-    "iso.org",
-    "afnor.org",
-    "certification.afnor.org",
-    "green-business.ec.europa.eu",
-    "basel.int",
-    "ellenmacarthurfoundation.org",
-    "bcorporation.net",
-    "ecovadis.com",
-    "unpri.org",
-    "ammc.ma",
-    "esma.europa.eu",
-    "finance.ec.europa.eu",
-]
+# Domaines mappes vers un theme prioritaire quand aucun mot-cle ne matche.
+MEDIA_SCOUT_DOMAIN_THEME_OVERRIDES = {
+    # ESG, QSE & SST (referentials, standards, health, safety)
+    "globalreporting.org":            "ESG, QSE & SST",
+    "efrag.org":                      "ESG, QSE & SST",
+    "unglobalcompact.org":            "ESG, QSE & SST",
+    "oecd.org":                       "ESG, QSE & SST",
+    "iso.org":                        "ESG, QSE & SST",
+    "afnor.org":                      "ESG, QSE & SST",
+    "green-business.ec.europa.eu":    "ESG, QSE & SST",
+    "ecovadis.com":                   "ESG, QSE & SST",
+    "ifrs.org":                       "ESG, QSE & SST",
+    "finance.ec.europa.eu":           "ESG, QSE & SST",
+    "unpri.org":                      "ESG, QSE & SST",
+    "ammc.ma":                        "ESG, QSE & SST",
+    "esginvestor.net":                "ESG, QSE & SST",
+    "environmental-finance.com":      "ESG, QSE & SST",
+    "imanor.gov.ma":                  "ESG, QSE & SST",
+    "sedex.com":                      "ESG, QSE & SST",
+    "brcgs.com":                      "ESG, QSE & SST",
+    "ifs-certification.com":          "ESG, QSE & SST",
+    "fssc.com":                       "ESG, QSE & SST",
+    "fairtrade.net":                  "ESG, QSE & SST",
+    "osha.europa.eu":                 "ESG, QSE & SST",
+    "osha.gov":                       "ESG, QSE & SST",
+    "ilo.org":                        "ESG, QSE & SST",
+    "who.int":                        "ESG, QSE & SST",
+    "fda.gov":                        "ESG, QSE & SST",
+    "efsa.europa.eu":                 "ESG, QSE & SST",
+    "health.ec.europa.eu":            "ESG, QSE & SST",
+    # Energie & Environnement (climat, eau, energie, biodiversite)
+    "tnfd.global":                    "Environnement, Eau & Energie",
+    "cdp.net":                        "Environnement, Eau & Energie",
+    "sciencebasedtargets.org":        "Environnement, Eau & Energie",
+    "ghgprotocol.org":                "Environnement, Eau & Energie",
+    "basel.int":                      "Environnement, Eau & Energie",
+    "unep.org":                       "Environnement, Eau & Energie",
+    "wri.org":                        "Environnement, Eau & Energie",
+    "carbonbrief.org":                "Environnement, Eau & Energie",
+    "climatechangenews.com":          "Environnement, Eau & Energie",
+    "irena.org":                      "Environnement, Eau & Energie",
+    # Agrumes, Fruits rouges & Maraichage (production vegetale orientee LDA)
+    # NB: fao.org, agriculture.gov.ma, onssa.gov.ma RETIRES car ils couvrent
+    # autant T1 (vegetal) que T2 (elevage). Le scoring keywords decide
+    # naturellement entre les 2 selon le contenu de l'article.
+    "globalgap.org":                  "Agrumes, Fruits rouges & Maraichage",
+    "food.ec.europa.eu":              "Agrumes, Fruits rouges & Maraichage",
+    # Elevage (filieres animales : ovin, bovin, caprin, volaille)
+    "woah.org":                       "Elevage (Ovins, Bovins, Caprins, Volailles)",
+    "poultryworld.net":               "Elevage (Ovins, Bovins, Caprins, Volailles)",
+    # Produits laitiers & Epicerie fine (filiere laitiere + food industry global)
+    "dairyreporter.com":              "Produits laitiers & Epicerie fine",
+    "foodnavigator.com":              "Produits laitiers & Epicerie fine",
+    # Concurrents LDA — sites corporates / pages presse (force T3)
+    "nestle-mena.com":                "Produits laitiers & Epicerie fine",
+    "groupe-bel.com":                 "Produits laitiers & Epicerie fine",
+    "ribambel.com":                   "Produits laitiers & Epicerie fine",
+    "aicha.com":                      "Produits laitiers & Epicerie fine",
+    "lesieur-cristal.com":            "Produits laitiers & Epicerie fine",
+    "lesieur-cristal.ma":             "Produits laitiers & Epicerie fine",  # legacy
+    # NB: news.google.com PAS dans le domain override car les feeds GNews
+    # couvrent plusieurs themes (T2 elevage ET T3 laitier). Le theme par feed
+    # est gere via MEDIA_SCOUT_FORCED_SOURCE_THEMES (par nom de source).
+}
 
 MEDIA_SCOUT_THEME_RULES = {
-    "Referentiels RSE": {
+    "Agrumes, Fruits rouges & Maraichage": {
         "strong": [
-            "gri", "csrd", "esrs", "efrag", "issb", "ifrs s1", "ifrs s2", "tnfd", "tcfd",
-            "ghg protocol", "cdp", "sbti", "iso 14001", "iso 50001", "iso 26000",
-            "b corp", "ecovadis", "taxonomie europeenne", "taxonomie verte", "sfdr",
-            "devoir de vigilance", "supply chain act", "lksg", "csddd",
-            "pacte mondial", "global compact", "ungc",
+            # Agrumes
+            "agrume", "agrumes", "orange", "oranges", "mandarine", "mandarines",
+            "clementine", "clementines", "citron", "citrons", "pamplemousse", "pamplemousses",
+            "pomelo", "lime", "kumquat", "bergamote", "filiere agrumes", "citrus",
+            "citron vert", "navel", "valencia", "maroc late",
+            # Fruits rouges
+            "fruits rouges", "fruit rouge", "fraise", "fraises", "framboise", "framboises",
+            "myrtille", "myrtilles", "mure", "mures", "cassis", "groseille", "groseilles",
+            "berries", "berry", "strawberry", "raspberry", "blueberry", "blackberry",
+            "cranberry", "filiere fraise", "petits fruits",
+            # Maraichage / legumes
+            "maraichage", "maraicher", "maraichers", "maraichere", "primeur", "primeurs",
+            "horticulture", "tomate", "tomates", "courgette", "courgettes",
+            "aubergine", "aubergines", "poivron", "poivrons", "piment", "concombre",
+            "concombres", "salade", "laitue", "oignon", "oignons", "ail", "carotte",
+            "carottes", "pomme de terre", "haricot vert", "petit pois", "epinard",
+            "chou", "brocoli", "artichaut", "asperge", "asperges", "navet", "radis",
+            "courge", "potiron", "melon", "melons", "pasteque", "raisin de table",
+            "fruit", "fruits", "legume", "legumes", "vegetable", "vegetables",
+            "transformation fruit", "transformation legume", "conserverie fruits",
+            "filiere fruits et legumes", "FELCOOP", "interfel",
         ],
         "medium": [
-            "reporting", "assurance", "materiality", "standards", "norme", "referentiel",
-            "indicateur esg", "notation esg", "due diligence", "certification", "labellisation",
-            "audit esg", "reporting durabilite", "rapport durabilite", "reporting extra-financier",
-            "divulgation", "disclosure", "transparence extra-financiere",
-            "taxonomie", "classification durable", "label rse", "label vert",
-            "notation extra-financiere", "agence de notation", "score esg",
+            # Pratiques de production vegetale
+            "verger", "vergers", "plantation", "exploitation", "serre", "serres",
+            "plein champ", "parcelle", "irrigation goutte a goutte", "irrigation localisee",
+            "semence", "semences", "engrais", "fertilisant", "fertilisants",
+            "pesticide", "pesticides", "phytosanitaire", "traitement phytosanitaire",
+            "recolte", "moisson", "campagne agricole", "campagne", "cueillette",
+            "calibrage", "conditionnement fruit", "station de conditionnement",
+            "chaine du froid", "post-recolte", "post recolte", "stockage frigo",
+            "exportation fruits", "exportation legumes", "agroexport",
+            "morocco foodex", "moroccan exports",
+            # Generique agriculture vegetale (pour rester capter les actus generales)
+            "agriculture", "agricole", "agroecologie", "agriculture biologique",
+            "permaculture", "cooperative agricole", "cooperative", "sol agricole",
+            "terre arable", "culture", "champ", "harvest", "crop", "farming",
+            "agronomie", "production vegetale", "plan maroc vert", "generation green",
+            "comader", "ada agence", "ormvar", "ormva",
         ],
         "weak": [
-            "scope 1", "scope 2", "scope 3", "kpi", "indicateur", "benchmark",
-            "standard", "framework", "conformite",
+            "agri", "production agricole",
         ],
     },
-    "Eau": {
+    "Elevage (Ovins, Bovins, Caprins, Volailles)": {
         "strong": [
-            "stress hydrique", "ressources en eau", "dessalement", "barrage", "secheresse",
-            "nappe phreatique", "water scarcity", "gestion de l'eau", "eau potable",
-            "assainissement", "qualite de l'eau", "penurie d'eau", "gestion hydraulique",
-            "ressource hydrique", "eau souterraine", "retenue d'eau", "transfert d'eau",
-            "bassin hydraulique", "amenagement hydraulique", "plan national de l'eau",
-            "crise hydrique", "deficit hydrique", "mobilisation de l'eau",
-            "retenue collinaire", "transfert inter-bassins", "programme eau",
-            "penurie eau", "acces a l'eau potable",
+            # Filieres ciblees LDA : ovin, bovin, caprin, volaille
+            "elevage", "eleveur", "eleveurs", "eleveuse",
+            "ovin", "ovins", "ovine", "filiere ovine", "elevage ovin",
+            "mouton", "moutons", "agneau", "agneaux", "brebis", "belier", "beliers",
+            "bovin", "bovins", "bovine", "filiere bovine", "elevage bovin",
+            "vache", "vaches", "veau", "veaux", "boeuf", "boeufs", "taureau", "genisse",
+            "caprin", "caprins", "caprine", "filiere caprine", "elevage caprin",
+            "chevre", "chevres", "chevreau", "bouc",
+            "volaille", "volailles", "filiere avicole", "filiere volaille", "aviculture",
+            "poulet", "poulets", "poule", "poules", "poule pondeuse", "poussin",
+            "dinde", "dindes", "canard", "canards", "oie", "oies", "pintade", "caille",
+            "broiler", "poultry",
+            # Concepts elevage transversaux
+            "betail", "cattle", "livestock", "viande", "viandes", "meat",
+            "viande rouge", "viande blanche", "filiere viande", "boucherie",
+            "abattoir", "abattoirs", "abattage", "slaughterhouse", "atelier de decoupe",
+            "sante animale", "veterinaire", "veterinaires", "veterinary",
+            "epizootie", "epizooties", "zoonose", "zoonoses", "antibioresistance",
+            "engraissement", "production de viande", "alimentation animale",
+            "feed industry", "fourrage", "fourrages", "ration", "ensilage",
+            "race ovine", "race bovine", "race caprine", "race avicole",
+            "interprovi", "anoc", "fivob",
+            # Aïd Al-Adha / Fête du sacrifice (evenement majeur filiere ovine MA)
+            "aid al adha", "aid el adha", "aid el kebir", "aid kebir",
+            "aid adha", "aid al-adha", "aid al kebir",
+            "eid al adha", "eid al-adha", "eid el kebir", "eid kebir",
+            "fete du sacrifice", "fête du sacrifice", "sacrifice du mouton",
+            "tabaski", "marche ovin", "marche aux moutons", "marche aux bestiaux",
+            "marche du betail", "souk al kbach", "souk kbach", "souk el kbach",
+            # Filiere viande / abattage Maroc
+            "sonacos", "filiere des viandes", "viande ovine",
+            "viande bovine", "viande caprine", "viande avicole",
         ],
         "medium": [
-            "hydrique", "irrigation", "nappe", "drought", "inondation", "precipitation",
-            "fleuve", "riviere", "lac", "bassin versant", "aquifere", "pluvial",
-            "debordement", "crue", "hydraulique", "oued", "ressource en eau",
-            "approvisionnement en eau", "distribution d'eau", "traitement de l'eau",
-            "epuration", "debit", "pluviometrie", "reseau d'eau", "branchement eau",
-            "desserte en eau", "pompage", "station d'epuration", "station de traitement",
-            "onee", "onep", "amenagement hydro",
+            "animal", "animale", "animaux", "troupeau", "troupeaux", "cheptel",
+            "boucher", "boucherie", "feed", "ferme d'elevage", "exploitation d'elevage",
+            "production animale", "filiere animale",
         ],
         "weak": [
-            "eau", "water", "pluie", "hydrologie", "meteorologie", "pluies",
+            "race animale",
         ],
     },
-    "Energie": {
+    "Produits laitiers & Epicerie fine": {
         "strong": [
+            # Produits laitiers (orientation transformation/distribution, vs Elevage = animal)
+            "produits laitiers", "produit laitier", "dairy", "dairy products",
+            "lait UHT", "lait pasteurise", "lait infantile", "formule infantile",
+            "infant formula", "lait en poudre", "milk powder", "lait fermente",
+            "lait demi-ecreme", "lait ecreme", "lait entier", "lactose", "sans lactose",
+            "fromage", "fromages", "fromagerie", "fromagerie artisanale", "cheese",
+            "fromage frais", "yaourt", "yaourts", "yogurt", "yogourt", "yoghurt",
+            "kefir", "skyr", "fromage blanc", "beurre", "creme", "creme fraiche",
+            "creme dessert", "lait infantile en poudre",
+            "centrale danone", "danone maroc", "danone", "lactalis", "lactel",
+            "yoplait", "savencia", "savencia fromage", "savencia dairy",
+            "copag", "jaouda", "safilait", "jibal", "groupe bel", "vache qui rit",
+            "lavachequirit", "kiri ", "president fromage", "nestle maroc", "nido ",
+            "laiterie", "laiteries", "industrie laitiere", "transformation laitiere",
+            "filiere laitiere", "production laitiere",
+            # Epicerie fine
+            "epicerie fine", "epicerie", "deli", "delicatessen", "fine food",
+            "gourmet food", "produits gourmets", "produits du terroir", "specialites alimentaires",
+            "confiserie", "chocolaterie", "biscuiterie", "miel", "confiture", "marmelade",
+            "huile d'olive", "huile vierge", "huiles fines", "condiment", "condiments",
+            "epices", "epices fines", "olives en saumure", "olive de table",
+            "conserve", "conserves", "conserverie", "saumure", "marinade",
+            "produits transformes", "ingredients premium",
+            # Concurrents LDA - epicerie fine (marques specifiques)
+            "aicha conserve", "aicha tomate", "lesieur cristal", "lesieur ",
+            "zouitina", "diana holding", "caracterre", "cartier saada",
+            "sovena", "oliveira da serra", "puget huile", "puget olive",
+            "bonne maman", "andros confiture", "andros ", "st dalfour",
+            "st. dalfour", "hero group", "hero confiture", "beldimarket",
+            "marjane gourmet", "carrefour selection",
+            # Distribution alimentaire / GMS (oriente vers epicerie/laitier)
+            "supermarche", "hypermarche", "grande surface", "moyenne surface",
+            "gms", "grande distribution", "distribution alimentaire", "retail alimentaire",
+            "fmcg", "produits de grande consommation", "ultra-frais", "rayon frais",
+            "rayon laitier", "rayon cremerie", "lineaire", "lineaire alimentaire",
+            "marque distributeur", "mdd", "private label", "private brand", "marque propre",
+            "carrefour", "auchan", "marjane", "label vie", "leclerc", "casino",
+            "lidl", "aldi", "intermarche", "metro cash", "monoprix", "franprix",
+            "drive alimentaire", "click and collect", "ecommerce alimentaire",
+            "centrale d'achat", "centrale achat", "category management",
+            "category manager", "merchandising", "tete de gondole",
+            "trade marketing", "shopper marketing", "interprolait", "fimalait",
+        ],
+        "medium": [
+            "distribution", "distributeur", "retail", "retailer", "enseigne",
+            "magasin", "consommateur", "consommation", "alimentaire", "agroalimentaire",
+            "food industry", "food trends", "food retail", "panier moyen",
+            "promotion", "promo", "soldes", "marketing au point de vente",
+            "implantation magasin", "ouverture magasin", "fermeture magasin",
+            "expansion magasin", "head of category", "buying",
+            "achat retail", "sourcing produits", "lait", "laitier", "laitiere",
+            "oeuf", "oeufs", "egg", "lactation",
+        ],
+        "weak": [
+            "vente", "achat",
+        ],
+    },
+    "Environnement, Eau & Energie": {
+        "strong": [
+            # Climat / Environnement
+            "changement climatique", "climate change", "biodiversite", "pollution",
+            "dechets", "recyclage", "neutralite carbone", "rechauffement climatique",
+            "deforestation", "qualite de l'air", "bilan carbone", "empreinte carbone",
+            "zero dechet", "economie circulaire", "accord de paris", "cop28", "cop29", "cop30",
+            "perte de biodiversite", "espece menacee", "extinction", "desertification",
+            "microplastique", "pollution plastique", "gaz a effet de serre",
+            "transition ecologique", "neutralite climatique", "net zero",
+            "carbon neutral", "economie verte", "green economy",
+            "pollution atmospherique", "pollution marine", "pollution des sols",
+            "rechauffement", "marche du carbone", "credit carbone",
+            "scope 1", "scope 2", "scope 3",
+            # Energie / Transition energetique
             "transition energetique", "efficacite energetique", "energies renouvelables",
             "renewable energy", "hydrogene vert", "panneau solaire", "panneaux solaires",
             "eolienne", "eoliennes", "photovoltaique", "mix energetique", "stockage energie",
@@ -254,37 +434,17 @@ MEDIA_SCOUT_THEME_RULES = {
             "independance energetique", "souverainete energetique", "decarbonation energetique",
             "reseau electrique intelligent", "smart grid", "centrale solaire",
             "parc solaire", "parc eolien", "centrale eolienne", "energie hydraulique",
-            "hydroelectricite", "puissance renouvelable installee",
-        ],
-        "medium": [
-            "energie", "energetique", "electricite", "renouvelable", "solaire", "hydrogene",
-            "energy", "solar", "wind", "centrale electrique", "puissance installee",
-            "capacite installee", "kwh", "mwh", "gwh", "twh", "biogaz", "biomasse",
-            "petrole", "gaz naturel", "charbon", "decarbonation", "electrification",
-            "interconnexion electrique", "reseau de transport", "tarif electricite",
-            "facture energetique", "consommation energetique", "production electrique",
-            "offshore", "onshore", "watt", "megawatt", "gigawatt",
-            "masen", "noor", "onee", "iresen", "aderee",
-            "combustible", "carburant", "fossile", "nucleaire", "thermique",
-            "puissance installee", "capacite energetique", "transition bas carbone",
-            "reseau electrique", "infrastructure energetique", "power",
-        ],
-        "weak": [
-            "led", "kilowatt", "turbine", "generateur", "raccordement electrique",
-            "compteur", "voltage",
-        ],
-    },
-    "Environnement": {
-        "strong": [
-            "changement climatique", "climate change", "biodiversite", "pollution",
-            "dechets", "recyclage", "neutralite carbone", "rechauffement climatique",
-            "deforestation", "qualite de l'air", "bilan carbone", "empreinte carbone",
-            "zero dechet", "economie circulaire", "accord de paris", "cop",
-            "perte de biodiversite", "espece menacee", "extinction", "desertification",
-            "microplastique", "pollution plastique", "gaz a effet de serre",
-            "transition ecologique", "neutralite climatique", "net zero",
-            "carbon neutral", "economie verte", "green economy",
-            "pollution atmospherique", "pollution marine", "pollution des sols",
+            "hydroelectricite", "puissance renouvelable installee", "energy transition",
+            "green hydrogen", "solar farm", "wind farm",
+            # Eau / Hydrique
+            "stress hydrique", "ressources en eau", "dessalement", "barrage", "secheresse",
+            "nappe phreatique", "water scarcity", "gestion de l'eau", "eau potable",
+            "assainissement", "qualite de l'eau", "penurie d'eau", "gestion hydraulique",
+            "ressource hydrique", "eau souterraine", "retenue d'eau", "transfert d'eau",
+            "bassin hydraulique", "amenagement hydraulique", "plan national de l'eau",
+            "crise hydrique", "deficit hydrique", "mobilisation de l'eau",
+            "retenue collinaire", "transfert inter-bassins", "programme eau",
+            "penurie eau", "acces a l'eau potable", "water stress", "drinking water",
         ],
         "medium": [
             "environnement", "climat", "carbone", "co2", "ges", "emissions", "nature",
@@ -296,108 +456,680 @@ MEDIA_SCOUT_THEME_RULES = {
             "decharge", "enfouissement", "collecte des dechets", "traitement des dechets",
             "etude d impact", "normes environnementales", "audit environnemental",
             "reserve de biosphere", "zone protegee", "espece", "milieu naturel",
-            "programme forestier", "hceflcd", "developpement durable",
+            "programme forestier", "hceflcd",
+            "energie", "energetique", "electricite", "renouvelable", "solaire", "hydrogene",
+            "energy", "solar", "wind", "centrale electrique", "puissance installee",
+            "capacite installee", "kwh", "mwh", "gwh", "twh", "biogaz", "biomasse",
+            "petrole", "gaz naturel", "charbon", "decarbonation", "electrification",
+            "interconnexion electrique", "reseau de transport", "tarif electricite",
+            "facture energetique", "consommation energetique", "production electrique",
+            "offshore", "onshore", "watt", "megawatt", "gigawatt",
+            "masen", "noor", "iresen", "aderee",
+            "combustible", "carburant", "fossile", "nucleaire", "thermique",
+            "reseau electrique", "infrastructure energetique", "power",
+            "hydrique", "irrigation", "nappe", "drought", "inondation", "precipitation",
+            "fleuve", "riviere", "lac", "bassin versant", "aquifere", "pluvial",
+            "debordement", "crue", "hydraulique", "oued", "ressource en eau",
+            "approvisionnement en eau", "distribution d'eau", "traitement de l'eau",
+            "epuration", "debit", "pluviometrie", "reseau d'eau", "branchement eau",
+            "desserte en eau", "pompage", "station d'epuration", "station de traitement",
+            "onee", "onep", "amenagement hydro", "water management",
         ],
         "weak": [
-            "durable", "durabilite", "ecologique", "vert", "verdure", "sustainable",
+            "ecologique", "vert", "verdure", "eau", "water", "pluie", "hydrologie", "pluies",
+            "kilowatt", "turbine", "generateur", "raccordement electrique",
+            "compteur", "voltage",
         ],
     },
-    "Responsabilite Sociale des Entreprises": {
+    "ESG, QSE & SST": {
         "strong": [
-            "responsabilite sociale", "responsabilite societale", "rse", "csr", "esg",
-            "devoir de vigilance", "rapport rse", "strategie rse", "politique rse",
-            "droits humains", "droits fondamentaux", "travail decent", "travail force",
-            "chaine d'approvisionnement responsable", "achats responsables",
-            "green bond", "obligation verte", "finance verte", "investissement vert",
-            "indice de durabilite", "maroc rse", "cgem rse",
+            # RSE / ESG
+            "rse", "csr", "esg", "responsabilite societale", "responsabilite sociale",
+            "social responsibility", "developpement durable", "sustainable development",
+            "rapport rse", "rapport extra-financier", "esg report", "sustainability report",
+            "materialite", "materiality", "double materialite", "double materiality",
+            "strategie rse", "csr strategy", "esg strategy", "engagement rse",
+            "csr commitment", "performance esg", "esg performance", "notation esg",
+            "esg rating", "indice esg", "esg index", "label rse", "csr label",
+            "objectifs odd", "sdg", "sustainable development goals",
+            "global compact", "pacte mondial", "ungc", "gri", "csrd",
+            "esrs", "efrag", "issb", "ifrs s1", "ifrs s2", "sasb", "ghg protocol",
+            "sbti", "tnfd", "tcfd", "cdp", "b corp", "ecovadis", "devoir de vigilance",
+            "csddd", "taxonomie europeenne", "sfdr", "achats responsables",
+            "supply chain durable", "labellisation rse", "reporting durabilite",
+            "rapport de durabilite", "due diligence",
+            # Normes ISO / QSE
+            "iso 26000", "iso 14001", "iso 9001", "iso 45001", "iso 50001",
+            "iso 22000", "iso 27001", "iso 31000", "iso 37001", "iso 37301",
+            "iso 14064", "iso 14067", "qse", "qualite securite environnement",
+            "smqse", "haccp", "fssc 22000",
+            # Referentiels supply chain / agroalimentaire
+            "globalgap", "global gap", "globalg.a.p", "smeta", "sedex audit",
+            "brc", "brcgs", "ifs food", "ifs broker", "halal", "casher", "kosher",
+            "fairtrade", "rainforest alliance", "fsc certification", "rspo",
+            # Sante / SST
+            "sante securite au travail", "occupational health and safety", "sst",
+            "accident du travail", "work accident", "maladie professionnelle",
+            "occupational disease", "prevention des risques", "risk prevention",
+            "document unique", "duer", "duerp", "chsct", "csst",
+            "harcelement moral", "harcelement sexuel", "harassment",
+            "stress au travail", "workplace stress", "ergonomie", "ergonomics",
+            "psychosociaux", "risques psychosociaux", "rps", "medecine du travail",
+            "inrs", "hygiene au travail",
         ],
         "medium": [
-            "gouvernance durable", "conditions de travail", "sante securite",
-            "egalite professionnelle", "inclusion", "diversite",
-            "parite", "formation professionnelle", "impact social",
-            "parties prenantes", "audit social", "bilan social", "bien-etre",
-            "qualite de vie au travail", "qvt", "engagement des salaries",
-            "mecenat", "economie sociale", "impact positif",
-            "entreprise responsable", "finance durable", "investissement responsable",
-            "isr", "impact investing", "entreprise citoyenne", "engagement societal",
-            "rapport de durabilite", "communication rse", "programme rse",
-            "charte sociale", "accord collectif", "dialogue social",
+            # ESG
+            "gouvernance", "governance", "ethique", "ethics", "transparence", "transparency",
+            "parties prenantes", "stakeholders", "impact social", "social impact",
+            "impact environnemental", "environmental impact", "diversite", "diversity",
+            "inclusion", "parite", "gender parity", "droits humains", "human rights",
+            "entreprise responsable", "engagement societal", "engagement social",
+            # QSE / SST
+            "securite", "safety", "sante publique", "sante au travail", "salarie",
+            "employee", "personnel", "staff", "rh", "ressources humaines",
+            "human resources", "prevention", "prevention sante", "absenteeism",
+            "absenteisme", "turn-over", "turnover", "epi", "equipement de protection",
+            "certification qualite", "audit qualite", "audit social",
         ],
         "weak": [
-            "gouvernance", "social", "solidarite", "equite", "ethique", "engagement",
+            "durable", "responsable", "sante",
+        ],
+    },
+}
+
+# ─── Veille Classification Rules ───────────────────────────────────────────────
+# Veille Informative = catch-all default (no specific rules).
+MEDIA_SCOUT_VEILLE_RULES = {
+    "Veille Reglementaire": {
+        "strong": [
+            # Lois & textes officiels
+            "loi", "decret", "reglement", "directive", "arrete", "ordonnance",
+            "projet de loi", "proposition de loi", "transposition", "parlement",
+            "adoption parlementaire", "promulgation", "journal officiel",
+            "bulletin officiel", "conseil de gouvernement", "conseil des ministres",
+            "regulation", "regulatory", "rulemaking", "compliance", "conformite",
+            "non-conformite", "sanction", "amende", "penalite", "fine",
+            "court ruling", "decision de justice", "jurisprudence", "tribunal",
+            "loi de finances", "loi cadre", "code de l'environnement",
+            "code du travail", "code de commerce", "code general des impots",
+            "regulator", "autorite de regulation", "exigence reglementaire",
+            "obligation legale", "obligation reglementaire",
+            # Normes ISO & cadres internationaux
+            "norme iso", "iso 9001", "iso 14001", "iso 14064", "iso 14067",
+            "iso 22000", "iso 26000", "iso 27001", "iso 31000", "iso 45001",
+            "iso 50001", "iso 37001", "iso 37301", "fssc 22000", "haccp",
+            "csrd", "esrs", "sfdr", "csddd", "devoir de vigilance",
+            "taxonomie europeenne", "taxonomy", "rgpd", "gdpr",
+            "afnor", "imanor", "norme nm", "norme marocaine",
+            # Normes & referentiels agroalimentaires / supply chain
+            "globalgap", "global gap", "globalg.a.p", "smeta", "sedex",
+            "brc", "brcgs", "ifs", "ifs food", "ifs broker", "ifs logistic",
+            "halal", "casher", "kosher", "bio", "agriculture biologique",
+            "fairtrade", "rainforest alliance", "fsc certification", "rspo",
+            "codex alimentarius", "codex", "label rouge", "aoc", "aop",
+            "igp", "stg",
+            # Sante / pharma / food regulators
+            "fda approval", "fda clearance", "fda warning", "fda recall",
+            "ema approval", "ammc circulaire", "ammc visa",
+            "onssa", "efsa", "dg sante", "who recommendation",
+            # Actes de mise a jour de normes
+            "nouvelle norme", "mise a jour de la norme", "revision de la norme",
+            "revision norme", "publication norme", "nouvelle version iso",
+            "nouvelle edition", "norme revisee",
+            "standards update", "standard revision", "new standard",
+        ],
+        "medium": [
+            "legal", "juridique", "reglementaire", "obligation", "exigence",
+            "requirement", "interdiction", "autorisation", "agrement",
+            "certification", "certifie", "certifiee", "label", "labellisation",
+            "cadre legal", "cadre juridique", "cadre reglementaire",
+            "ratification", "convention internationale", "accord international",
+            "regle", "audit reglementaire", "audit de conformite",
+            "rappel produit", "recall", "homologation", "agrement sanitaire",
+        ],
+        "weak": [
+            "code", "norme", "standard", "referentiel", "normative",
+        ],
+    },
+    "Veille Evenementielle": {
+        "strong": [
+            "salon", "salon international", "conference", "sommet", "summit",
+            "congres", "forum", "journee mondiale", "journee internationale",
+            "world day", "international day", "evenement", "cop28", "cop29", "cop30",
+            "exposition", "foire", "foire internationale", "atelier",
+            "workshop", "webinaire", "webinar", "edition annuelle",
+            "rendez-vous annuel", "rassemblement", "rencontre internationale",
+            "rencontres", "convention", "ceremonie", "inauguration",
+            "table ronde", "panel discussion", "seminaire", "festival",
+            "trade show", "expo", "world expo", "davos", "world economic forum",
+            "wef annual meeting", "cop", "conference des parties",
+        ],
+        "medium": [
+            "organise", "tenir", "accueille", "se tiendra", "se tient",
+            "rdv", "rencontre", "lancement officiel", "inaugure", "ouvre ses portes",
+            "cloture", "edition", "manifestation",
+        ],
+        "weak": [
+            "event",
+        ],
+    },
+    "Veille Concurrentielle": {
+        "strong": [
+            "levee de fonds", "fundraising", "tour de financement", "serie a",
+            "serie b", "serie c", "fusion", "acquisition", "merger", "m&a",
+            "rachat", "cession", "prise de participation", "joint venture",
+            "alliance strategique", "partenariat strategique", "partnership",
+            "introduction en bourse", "ipo", "cotation",
+            "resultats financiers", "resultats annuels", "resultats semestriels",
+            "resultats trimestriels", "chiffre d'affaires", "ca annuel", "ebitda",
+            "benefice net", "marge operationnelle", "plan strategique",
+            "feuille de route", "roadmap", "lance un produit", "lance une offre",
+            "lance une nouvelle", "lancement officiel", "lancement de",
+            "nouveau produit", "nouvelle offre",
+            "ceo", "pdg", "directeur general", "presidente directrice generale",
+            "nomination", "nomme", "nommee", "nouveau directeur",
+            "restructuration", "plan social", "plan de depart", "layoff",
+            "licenciement", "fermeture de site", "expansion", "investissement de",
+            "ouvre une usine", "ouvre un site", "contrat de",
+            "appel d'offres remporte", "remporte un contrat", "decroche un contrat",
+            "consortium", "marche public",
+            "lancement de marque", "rebranding", "relance",
+            # ── Concurrents LDA — Produits laitiers (Maroc + International) ────
+            "centrale danone", "danone maroc", "danone", "copag", "jaouda",
+            "safilait", "jibal", "groupe bel", "vache qui rit", "lavachequirit",
+            "kiri ", "president fromage", "lactel", "lactalis", "savencia",
+            "savencia fromage", "savencia dairy", "nestle maroc", "nestle ",
+            "nido ", "label vie", "labelvie", "bim maroc",
+            # ── Concurrents LDA — Epicerie fine (Maroc + International) ────────
+            "aicha conserve", "aicha tomate", "lesieur cristal", "lesieur ",
+            "zouitina", "diana holding", "caracterre", "cartier saada",
+            "sovena", "oliveira da serra", "puget huile", "puget olive",
+            "bonne maman", "andros confiture", "andros ", "st dalfour",
+            "st. dalfour", "hero group", "hero confiture", "beldimarket",
+            "marjane gourmet", "carrefour selection", "marjane mdd",
+        ],
+        "medium": [
+            "entreprise", "groupe", "societe", "company", "filiale", "subsidiary",
+            "marche", "client", "produit", "service", "offre", "strategie",
+            "dirigeant", "executive", "managing director", "nominations",
+        ],
+        "weak": [
+            "business",
         ],
     },
 }
 
 # Sources strictement mono-thematiques : fallback quand aucun mot-cle ne matche.
 # Critere d'inclusion : la source ne couvre QU'UN seul theme (organisme dedie ou URL specialisee).
-# A NE PAS inclure : sources multi-thematiques (AgriMaroc=agriculture large, Actu-Environnement,
-# WRI, CGEM, Ministere Equipement et Eau qui couvre aussi l'infrastructure, etc.)
 MEDIA_SCOUT_FORCED_SOURCE_THEMES = {
-    "Ministere Transition Energetique": "Energie",        # mem.gov.ma : 100% energie/mines
-    "Departement Environnement":        "Environnement",  # environnement.gov.ma : 100% env
-    "IEA":                              "Energie",        # International Energy Agency
-    "IRENA":                            "Energie",        # International Renewable Energy
-    "UNEP":                             "Environnement",  # UN Environment Programme
-    "MAP Ecology":                      "Environnement",  # site dedie ecologie
-    "Novethic":                         "RSE & Referentiels",  # /actualite/rse : 100% RSE
-    "UN Global Compact":                "RSE & Referentiels",
-    "OECD RBC":                         "RSE & Referentiels",
-    "ISO 26000":                        "RSE & Referentiels",
-    "ISO 14001":                        "RSE & Referentiels",
-    "ISO 14000 Family":                 "RSE & Referentiels",
-    "AFNOR ISO 14001":                  "RSE & Referentiels",
-    "AFNOR Certification ISO 14001":     "RSE & Referentiels",
-    "EU EMAS":                          "RSE & Referentiels",
-    "Basel Convention":                 "RSE & Referentiels",
-    "Ellen MacArthur Foundation":        "RSE & Referentiels",
-    "B Lab Global":                     "RSE & Referentiels",
-    "B Lab Standards":                  "RSE & Referentiels",
-    "EcoVadis":                         "RSE & Referentiels",
-    "PRI":                              "RSE & Referentiels",
-    "AMMC Finance Durable":             "RSE & Referentiels",
-    "IFRS / SASB":                      "RSE & Referentiels",
-    "ESMA Sustainable Finance":         "RSE & Referentiels",
-    "European Commission Sustainable Finance": "RSE & Referentiels",
+    # ── MAROC (sources qui marchent uniquement) ─────────────────────────────
+    # NB : AgriMaroc / ONSSA / FAO ne sont PAS forces car ils couvrent a la fois
+    # T1 (production vegetale) ET T2 (elevage). Le scoring keywords decide.
+    "Le Vert":                          "Environnement, Eau & Energie",
+    "Le Vert - Developpement Durable":  "Environnement, Eau & Energie",
+    "MAP Ecology":                      "Environnement, Eau & Energie",
+    "Ministere Equipement et Eau":      "Environnement, Eau & Energie",
+
+    # ── UE - Reglementation alimentaire (impact direct exports Maroc) ─────
+    "EFSA":                             "ESG, QSE & SST",
+    "DG SANTE EU - Food":               "ESG, QSE & SST",
+
+    # ── UE - ESG / QSE / SST (sources qui marchent) ──────────────────────
+    "AFNOR Actualites":                      "ESG, QSE & SST",
+    "EU EMAS":                               "ESG, QSE & SST",
+    "EFRAG":                                 "ESG, QSE & SST",
+
+    # ── UE - Food industry (couverture globale, pas locale) ───────────────
+    "Food Navigator":                   "Produits laitiers & Epicerie fine",
+
+    # ── CONCURRENTS LDA — sites corporates HTML (forces T3)
+    "Lesieur Cristal":                  "Produits laitiers & Epicerie fine",
+    # ── CONCURRENTS LDA — Google News RSS aggregated feeds (forces T3)
+    "GNews — Centrale Danone":          "Produits laitiers & Epicerie fine",
+    "GNews — COPAG Jaouda":             "Produits laitiers & Epicerie fine",
+    "GNews — Lesieur Cristal":          "Produits laitiers & Epicerie fine",
+    "GNews — Marjane Maroc":            "Produits laitiers & Epicerie fine",
+    "GNews — Bel Maroc":                "Produits laitiers & Epicerie fine",
+    "GNews — Lactalis":                 "Produits laitiers & Epicerie fine",
+    "GNews — Savencia":                 "Produits laitiers & Epicerie fine",
+    "GNews — Bonne Maman Andros":       "Produits laitiers & Epicerie fine",
+    "GNews — Hero St Dalfour":          "Produits laitiers & Epicerie fine",
+    "GNews — Olive MA":                 "Produits laitiers & Epicerie fine",
+    "GNews — Sovena Puget":             "Produits laitiers & Epicerie fine",
+    # ── PRESSE ÉCONOMIQUE MAROC RSS (PAS forces — classification naturelle)
+    # NB: EcoActu / Aujourd'hui Maroc / Challenge / Financial Afrik ne sont
+    # PAS dans ce dict -> theme decide par keywords + LLM validator
+
+    # ── WORLD - Agriculture (production vegetale OU elevage selon contenu) ─
+    # FAO Newsroom : non force, couvre veg + elevage -> scoring decide
+
+    # ── WORLD - Elevage (ovin/bovin/caprin/volaille) ──────────────────────
+    "WOAH (OIE)":                       "Elevage (Ovins, Bovins, Caprins, Volailles)",
+    "DairyReporter":                    "Produits laitiers & Epicerie fine",
+    # ── MAROC - Elevage (sources dediees) ─────────────────────────────────
+    "AgriMaroc Élevage":                "Elevage (Ovins, Bovins, Caprins, Volailles)",
+    # ── Google News RSS - Elevage MA (forces T2 — betail strict)
+    "GNews — Bétail MA":                "Elevage (Ovins, Bovins, Caprins, Volailles)",
+    "GNews — Aviculture MA":            "Elevage (Ovins, Bovins, Caprins, Volailles)",
+    "GNews — Viande MA":                "Elevage (Ovins, Bovins, Caprins, Volailles)",
+    "GNews — ANOC FIVOB":               "Elevage (Ovins, Bovins, Caprins, Volailles)",
+    "GNews — Lait Maroc":               "Elevage (Ovins, Bovins, Caprins, Volailles)",
+
+    # ── WORLD - Environnement / Climat / Energie (sources qui marchent) ───
+    "Climate Home News":                "Environnement, Eau & Energie",
+    "Carbon Brief":                     "Environnement, Eau & Energie",
+
+    # ── WORLD - ESG / QSE / SST (sources qui marchent) ────────────────────
+    "UN Global Compact":                "ESG, QSE & SST",
+    "FDA News":                         "ESG, QSE & SST",
+    "Fairtrade International":          "ESG, QSE & SST",
+
+    # ── Google News RSS - BACKFILL T4 Environnement (forces T4) ───────────
+    "GNews — Eau Maroc":                "Environnement, Eau & Energie",
+    "GNews — Energie Maroc":            "Environnement, Eau & Energie",
+    "GNews — Climat Maroc":             "Environnement, Eau & Energie",
+    # ── Google News RSS - BACKFILL T5 Normes/ESG/QSE/SST (forces T5) ──────
+    "GNews — Normes RSE":               "ESG, QSE & SST",
+    "GNews — Securite alimentaire":     "ESG, QSE & SST",
+    "GNews — QSE SST Maroc":            "ESG, QSE & SST",
+    "GNews — Gouvernance ESG MA":       "ESG, QSE & SST",
+
+}
+
+# Approche : on collecte la data depuis toutes les sources, puis on categorise chaque
+# article par theme + veille via _assign_media_theme / _assign_media_veille (keyword scoring).
+# Plus de mapping source -> veille a priori : chaque article est juge sur son contenu.
+
+
+# Pays d'origine de chaque source (pour filtrage fin)
+MEDIA_SCOUT_SOURCE_ORIGINS = {
+    # Maroc
+    "AgriMaroc": "Maroc",
+    "AgriMaroc Élevage": "Maroc",
+    "FNH - Finances News Hebdo": "Maroc",
+    "CGEM": "Maroc",
+    "Le Vert": "Maroc",
+    "Le Vert - Developpement Durable": "Maroc",
+    "Medias24 - Environnement": "Maroc",
+    "Medias24 - Entreprises": "Maroc",
+    "MAP Ecology": "Maroc",
+    "Ministere Transition Energetique": "Maroc",
+    "Ministere Equipement et Eau": "Maroc",
+    "Departement Environnement": "Maroc",
+    "Ministere Agriculture": "Maroc",
+    "Ministere Sante": "Maroc",
+    "ONSSA": "Maroc",
+    "IMANOR": "Maroc",
+    "AMMC": "Maroc",
+    "Aïcha": "Maroc",
+    "Lesieur Cristal": "Maroc",
+    # Presse economique Maroc (RSS)
+    "EcoActu": "Maroc",
+    "Aujourd'hui Maroc": "Maroc",
+    "Challenge.ma": "Maroc",
+
+    # France (couvertures UE / globales uniquement)
+    "Actu-Environnement": "France",
+    "Novethic": "France",
+    "AFNOR Actualites": "France",
+    "EcoVadis": "France",
+    "Groupe Bel": "France",
+    "Ribambel (Bel)": "France",
+    "Nestlé MENA": "International",
+    # Google News RSS (multi-source aggregators) -> zone "International"
+    "GNews — Centrale Danone": "International",
+    "GNews — COPAG Jaouda": "International",
+    "GNews — Lesieur Cristal": "International",
+    "GNews — Marjane Maroc": "International",
+    "GNews — Bel Maroc": "International",
+    "GNews — Lactalis": "International",
+    "GNews — Savencia": "International",
+    "GNews — Bonne Maman Andros": "International",
+    "GNews — Hero St Dalfour": "International",
+    "GNews — Olive MA": "International",
+    "GNews — Sovena Puget": "International",
+    # Google News RSS - Elevage MA (aggregators - betail strict)
+    "GNews — Bétail MA": "International",
+    "GNews — Aviculture MA": "International",
+    "GNews — Viande MA": "International",
+    "GNews — ANOC FIVOB": "International",
+    "GNews — Lait Maroc": "International",
+    # Google News RSS - BACKFILL T4 Environnement + T5 Normes
+    "GNews — Eau Maroc": "International",
+    "GNews — Energie Maroc": "International",
+    "GNews — Climat Maroc": "International",
+    "GNews — Normes RSE": "International",
+    "GNews — Securite alimentaire": "International",
+    "GNews — QSE SST Maroc": "International",
+    "GNews — Gouvernance ESG MA": "International",
+    "Financial Afrik": "International",
+
+    # UE (institutions europeennes)
+    "EFSA": "UE",
+    "DG SANTE EU - Food": "UE",
+    "EU Health News": "UE",
+    "EU EMAS": "UE",
+    "EFRAG": "UE",
+    "European Commission Sustainable Finance": "UE",
+    "EU-OSHA": "UE",
+
+    # Royaume-Uni (couvertures globales uniquement)
+    "Food Navigator": "Royaume-Uni",
+    "Climate Home News": "Royaume-Uni",
+    "Carbon Brief": "Royaume-Uni",
+    "Energy Voice": "Royaume-Uni",
+    "DairyReporter": "Royaume-Uni",
+    "BRCGS": "Royaume-Uni",
+    "Sedex (SMETA)": "Royaume-Uni",
+    "CDP": "Royaume-Uni",
+    "TNFD": "Royaume-Uni",
+
+    # USA (couvertures globales / régulations alimentaires impactant exports Maroc)
+    "FDA News": "USA",
+    "OSHA US": "USA",
+    "WRI": "USA",
+
+    # Allemagne
+    "IFS Food": "Allemagne",
+    "GlobalG.A.P.": "Allemagne",
+    "Fairtrade International": "Allemagne",
+
+    # Pays-Bas
+    "Poultry World": "Pays-Bas",
+    "FSSC 22000": "Pays-Bas",
+
+    # International / Onusien (HQ Geneve, NY, Paris, etc.)
+    "ISO News": "International",
+    "ISO 26000": "International",
+    "ISO 14001": "International",
+    "ISO 14000 Family": "International",
+    "FAO Newsroom": "International",
+    "WOAH (OIE)": "International",
+    "UN Global Compact": "International",
+    "OECD RBC": "International",
+    "WHO News": "International",
+    "Codex Alimentarius": "International",
+    "ILO Safework": "International",
+    "UNEP": "International",
+    "IRENA": "International",
+    "Basel Convention": "International",
+    "SBTi": "International",
+    "GHG Protocol": "International",
+    "GRI": "International",
+    "IFRS / ISSB": "International",
+    "IFRS / SASB": "International",
+    "PRI": "International",
+    "ESG Investor": "International",
+    "Environmental Finance": "International",
+}
+
+
+def get_source_origin(journal: str) -> str:
+    """Retourne le pays d'origine d'une source. Defaut: 'Autre'."""
+    return MEDIA_SCOUT_SOURCE_ORIGINS.get(journal, "Autre")
+
+
+# Zone geographique de chaque source : MAROC | EU | WORLD
+MEDIA_SCOUT_SOURCE_ZONES = {
+    # MAROC
+    "AgriMaroc":                              "MAROC",
+    "AgriMaroc Élevage":                      "MAROC",
+    "FNH - Finances News Hebdo":              "MAROC",
+    "CGEM":                                   "MAROC",
+    "Le Vert":                                "MAROC",
+    "Le Vert - Developpement Durable":        "MAROC",
+    "Medias24 - Environnement":               "MAROC",
+    "Medias24 - Entreprises":                 "MAROC",
+    "MAP Ecology":                            "MAROC",
+    "Ministere Transition Energetique":       "MAROC",
+    "Ministere Equipement et Eau":            "MAROC",
+    "Departement Environnement":              "MAROC",
+    "Ministere Agriculture":                  "MAROC",
+    "Ministere Sante":                        "MAROC",
+    "ONSSA":                                  "MAROC",
+    "IMANOR":                                 "MAROC",
+    "AMMC":                                   "MAROC",
+    "Aïcha":                                  "MAROC",
+    "Lesieur Cristal":                        "MAROC",
+    # Presse economique Maroc (RSS)
+    "EcoActu":                                "MAROC",
+    "Aujourd'hui Maroc":                      "MAROC",
+    "Challenge.ma":                           "MAROC",
+
+    # EU (couvertures globales / directives impactant Maroc)
+    "EFSA":                                   "EU",
+    "DG SANTE EU - Food":                     "EU",
+    "Actu-Environnement":                     "EU",
+    "Novethic":                               "EU",
+    "AFNOR Actualites":                       "EU",
+    # Concurrents LDA EU (laitier + epicerie) - corporates parents
+    "Groupe Bel":                             "EU",
+    "Ribambel (Bel)":                         "EU",
+    "Nestlé MENA":                            "WORLD",
+    # Google News RSS aggregators (multi-source)
+    # Google News RSS aggregators (multi-source) -> tagged WORLD
+    "GNews — Centrale Danone":                "WORLD",
+    "GNews — COPAG Jaouda":                   "WORLD",
+    "GNews — Lesieur Cristal":                "WORLD",
+    "GNews — Marjane Maroc":                  "WORLD",
+    "GNews — Bel Maroc":                      "WORLD",
+    "GNews — Lactalis":                       "WORLD",
+    "GNews — Savencia":                       "WORLD",
+    "GNews — Bonne Maman Andros":             "WORLD",
+    "GNews — Hero St Dalfour":                "WORLD",
+    "GNews — Olive MA":                       "WORLD",
+    "GNews — Sovena Puget":                   "WORLD",
+    # Google News RSS - Elevage MA (forces T2 - betail strict)
+    "GNews — Bétail MA":                      "WORLD",
+    "GNews — Aviculture MA":                  "WORLD",
+    "GNews — Viande MA":                      "WORLD",
+    "GNews — ANOC FIVOB":                     "WORLD",
+    "GNews — Lait Maroc":                     "WORLD",
+    # Google News RSS - BACKFILL T4 Environnement + T5 Normes
+    "GNews — Eau Maroc":                      "WORLD",
+    "GNews — Energie Maroc":                  "WORLD",
+    "GNews — Climat Maroc":                   "WORLD",
+    "GNews — Normes RSE":                     "WORLD",
+    "GNews — Securite alimentaire":           "WORLD",
+    "GNews — QSE SST Maroc":                  "WORLD",
+    "GNews — Gouvernance ESG MA":             "WORLD",
+    "Financial Afrik":                        "WORLD",
+    "EU EMAS":                                "EU",
+    "EFRAG":                                  "EU",
+    "Food Navigator":                         "EU",
+
+    # WORLD
+    "FAO Newsroom":                           "WORLD",
+    "Codex Alimentarius":                     "WORLD",
+    "GlobalG.A.P.":                           "WORLD",
+    "WOAH (OIE)":                             "WORLD",
+    "DairyReporter":                          "WORLD",
+    "Poultry World":                          "WORLD",
+    "UNEP":                                   "WORLD",
+    "WRI":                                    "WORLD",
+    "TNFD":                                   "WORLD",
+    "SBTi":                                   "WORLD",
+    "CDP":                                    "WORLD",
+    "GHG Protocol":                           "WORLD",
+    "Climate Home News":                      "WORLD",
+    "Carbon Brief":                           "WORLD",
+    "IRENA":                                  "WORLD",
+    "Energy Voice":                           "WORLD",
+    "Basel Convention":                       "WORLD",
+    "UN Global Compact":                      "WORLD",
+    "OECD RBC":                               "WORLD",
+    "ISO News":                               "WORLD",
+    "ISO 26000":                              "WORLD",
+    "ISO 14001":                              "WORLD",
+    "ISO 14000 Family":                       "WORLD",
+    "EcoVadis":                               "WORLD",
+    "GRI":                                    "WORLD",
+    "IFRS / ISSB":                            "WORLD",
+    "IFRS / SASB":                            "WORLD",
+    "ESG Investor":                           "WORLD",
+    "Environmental Finance":                  "WORLD",
+    "PRI":                                    "WORLD",
+    "ILO Safework":                           "WORLD",
+    "OSHA US":                                "WORLD",
+    "FDA News":                               "WORLD",
+    "WHO News":                               "WORLD",
+    "Sedex (SMETA)":                          "WORLD",
+    "BRCGS":                                  "WORLD",
+    "IFS Food":                               "WORLD",
+    "FSSC 22000":                             "WORLD",
+    "Fairtrade International":                "WORLD",
 }
 
 MEDIA_SCOUT_SOURCE_THEME_HINTS = {
-    "Eau": [
-        "eau", "water", "equipement.gov.ma", "hydrique",
-        "agrimaroc", "irrigation", "barrage",
+    "Agrumes, Fruits rouges & Maraichage": [
+        "agri", "agriculture", "agrimaroc", "fao", "ministere agriculture", "onssa",
+        "globalgap", "codex", "food.ec.europa",
+        "agrume", "fruits", "legume", "maraichage", "primeur", "horticulture",
+        "fraise", "framboise", "myrtille", "berries", "citrus", "orange", "mandarine",
+        "tomate", "courgette", "aubergine", "poivron",
     ],
-    "Energie": [
+    "Elevage (Ovins, Bovins, Caprins, Volailles)": [
+        "elevage", "viande", "volaille", "bovin", "ovin", "caprin", "poultry",
+        "woah", "poultryworld",
+        "mouton", "chevre", "agneau", "boeuf", "poulet", "dinde", "canard",
+        "abattoir", "veterinaire", "sante animale",
+    ],
+    "Produits laitiers & Epicerie fine": [
+        "foodnavigator", "dairyreporter",
+        "lait", "laitier", "laiterie", "dairy", "fromage", "yaourt", "beurre",
+        "epicerie", "deli", "delicatessen", "gourmet", "terroir",
+        "produits laitiers", "epicerie fine",
+    ],
+    "Environnement, Eau & Energie": [
+        "eau", "water", "equipement.gov.ma", "hydrique", "irrigation", "barrage",
         "energie", "energy", "iea", "irena", "transition-energetique", "mem.gov.ma",
-        "le vert", "levert", "energetique", "renouvelable", "masen", "noor",
-    ],
-    "Environnement": [
+        "levert", "energetique", "renouvelable", "masen", "noor",
         "environnement", "environment", "ecology", "climate", "unep", "wri", "mapecology",
-        "le vert", "levert", "medias24", "actu-environnement", "actu environnement",
-        "map ecology", "developpement-durable", "developpement durable",
+        "medias24", "actu-environnement", "carbonbrief", "climatechangenews",
+        "tnfd", "sbti", "ghgprotocol", "cdp", "basel",
     ],
-    "Responsabilite Sociale des Entreprises": [
-        "rse", "csr", "esg", "cgem", "novethic", "ecoactu", "fnh", "finances news",
-        "unglobalcompact", "global compact", "oecd", "responsible business conduct",
-        "bcorporation", "b corp", "b lab", "ecovadis", "unpri", "pri", "ammc",
-    ],
-    "Referentiels RSE": [
-        "globalreporting", "efrag", "ifrs", "tnfd", "cdp", "sciencebasedtargets", "ghgprotocol",
-        "iso", "iso 26000", "iso 14001", "sasb", "issb", "esma", "taxonomy", "taxonomie",
-        "sfdr", "csrd", "esrs", "finance.ec.europa", "sustainable finance",
-        "iso 14000", "management environnemental", "systeme de management environnemental",
-        "environmental management system", "emas", "afnor", "basel convention",
-        "convention de bale", "dechets dangereux", "waste management standard",
-        "audit environnemental", "certification environnementale", "cycle de vie",
-        "circular economy framework", "economie circulaire", "referentiel dechets",
-        "norme dechets", "valorisation des dechets", "recyclage",
+    "ESG, QSE & SST": [
+        "rse", "csr", "esg", "cgem", "novethic", "fnh", "globalreporting",
+        "efrag", "ifrs", "iso", "sasb", "issb", "unglobalcompact", "global compact",
+        "oecd", "ecovadis", "afnor",
+        "imanor", "ammc", "sedex", "brcgs", "ifs-certification", "fssc", "fairtrade",
+        "osha", "ilo", "safework", "sante", "who.int", "fda.gov",
+        "efsa.europa", "health.ec.europa",
     ],
 }
+
+# ─── Filtres post-classification ──────────────────────────────────────────────
+# Objectif : garder articles pertinents pour le Maroc (direct ou impact indirect),
+# retirer le bruit pays-specifique (France/UK/US/etc. sans portee internationale),
+# et pour le theme IA, retirer le bruit "infrastructure" (data centers, GPUs).
+
+# Mentions directes Maroc -> garde toujours
+MEDIA_SCOUT_MOROCCO_DIRECT_MARKERS = [
+    "maroc", "morocco", "marocain", "marocaine", "marocains", "marocaines",
+    "maghreb", "afrique du nord", "north africa",
+    "casablanca", "rabat", "tanger", "marrakech", "fes ", "agadir", "meknes",
+    "oujda", "tetouan", "kenitra", "dakhla", "laayoune", "ouarzazate", "nador",
+    "ocp ", "managem", "attijariwafa", "bcp ", "bank of africa", "cih bank",
+    "marjane", "label vie", "groupe ynna", "saham", "akwa group",
+    "maroc telecom", "iam ", "addoha", "alliances",
+    "cnss", "anapec", "agence pour la promotion",
+    "dh ", "dirham", "dirhams",
+]
+
+# Portee large / internationale / EU-wide / standards -> garde
+MEDIA_SCOUT_BROAD_SCOPE_MARKERS = [
+    # Portee globale / internationale
+    "international", "internationale", "internationaux", "internationales",
+    "mondial", "mondiale", "mondiaux", "mondiales", "monde",
+    "global", "globale", "globally", "worldwide", "world ",
+    # Afrique
+    "afrique", "africa", "africain", "african", "pan-african", "panafricain",
+    "afdb", "african development bank", "bad ",
+    # Mediterranee
+    "mediterranee", "mediterranean", "pays mediterraneens", "mena ",
+    "moyen-orient", "middle east",
+    # EU institutionnel
+    "union europeenne", "european union", " ue ", " eu ",
+    "commission europeenne", "european commission",
+    "conseil europeen", "european council", "parlement europeen", "european parliament",
+    "directive europeenne", "european directive", "reglement europeen",
+    "eu regulation", "eu directive", "eu taxonomy", "taxonomie europeenne",
+    "csrd", "esrs", "sfdr", "csddd", "cbam", "esma", "efrag", "efsa",
+    "dg sante", "dg env", "dg agri", "european green deal", "pacte vert",
+    # Standards / referentiels internationaux
+    "iso ", "norme iso", "iso 9001", "iso 14001", "iso 22000", "iso 26000",
+    "iso 45001", "iso 50001", "iso 14064", "iso 14067",
+    "fssc 22000", "haccp",
+    "gri ", "ifrs s1", "ifrs s2", "sasb", "issb", "tcfd", "tnfd", "cdp ",
+    "ghg protocol", "sbti", "science based targets",
+    "globalgap", "global gap", "globalg.a.p", "smeta", "sedex",
+    "brc", "brcgs", "ifs food", "fairtrade", "rspo", "rainforest alliance",
+    "fsc certification", "ifoam", "codex alimentarius", "b corp", "ecovadis",
+    # Organismes internationaux
+    "fao ", "wto ", "omc ", "oms ", "who ", "ilo ", "oit ", "ocde", "oecd",
+    "world bank", "banque mondiale", "fmi", "imf",
+    "g7 ", "g20", "g7,", "g20,",
+    "cop28", "cop29", "cop30", "cop31", "cop ",
+    "nations unies", "united nations", "global compact", "ungc",
+    "fda ", "usda ", "ema ", "ich ",
+    # Climat / supply chain / sustainability scope
+    "climate change", "changement climatique", "rechauffement climatique",
+    "neutralite carbone", "carbon neutrality", "net zero", "carbon neutral",
+    "accord de paris", "paris agreement", "paris accord",
+    "biodiversite", "biodiversity", "deforestation",
+    "supply chain", "chaine d'approvisionnement", "chaine de valeur",
+    "transition energetique", "energy transition", "transition ecologique",
+    "ecologic transition",
+    # Marchés transverses / exports
+    "exportation", "import-export", "commerce international", "international trade",
+    "trade agreement", "accord commercial",
+]
+
+# Marqueurs pays-specifiques sans portee internationale -> drop sauf si marqueur positif present
+MEDIA_SCOUT_COUNTRY_SPECIFIC_MARKERS = [
+    # France
+    "hexagone", "metropole francaise", "departement francais", "departements francais",
+    "elysee", "matignon", "premier ministre francais", "gouvernement francais",
+    "ministre francais", "ministre de france", "assemblee nationale francaise",
+    "senat francais", "conseil constitutionnel francais",
+    "ile-de-france", "bretagne", "normandie", "auvergne", "occitanie",
+    "nouvelle-aquitaine", "hauts-de-france", "grand est", "bourgogne",
+    "pays de la loire", "centre-val de loire", "provence-alpes",
+    "prefet", "prefecture", "sous-prefet", "rectorat", "academie de",
+    "loi francaise", "decret francais", "code du travail francais",
+    "smic", "rsa ", "csg", "crds", "arcep", "arcom", "cnil",
+    "fiscalite francaise", "tva francaise",
+    "macron", "borne", "attal", "barnier", "lecornu",
+    # UK
+    "downing street", "westminster", "british government",
+    "house of commons", "house of lords", "scotland regulation",
+    "wales regulation", "england only", "uk parliament", "british retailer",
+    "rishi sunak", "keir starmer", "ofcom", "fca uk",
+    # US (US-state-specific, not Federal which often has global impact)
+    "california law", "texas law", "new york state", "florida state",
+    "us state-level", "california bill", "us governor",
+    "house ways and means", "us house energy and commerce",
+    # Germany
+    "bundestag", "bundesrat", "bundesregierung",
+    "scholz", "merz administration",
+    # Spain
+    "moncloa", "congreso de los diputados",
+    "ley espanola",
+    # Italy
+    "palazzo chigi", "camera dei deputati",
+    "meloni",
+]
 
 MEDIA_SCOUT_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/122.0 Safari/537.36"
-    )
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
 }
 
 
@@ -497,8 +1229,10 @@ def _article_record(source_url, title, description, link, date_value):
 
 
 def _fetch_media_url(url):
+    # timeout=(connect, read) : echoue vite sur un hote mort (5s pour ouvrir la
+    # connexion) tout en laissant le temps de lire une page lente (9s).
     try:
-        response = requests.get(url, headers=MEDIA_SCOUT_HEADERS, timeout=14)
+        response = requests.get(url, headers=MEDIA_SCOUT_HEADERS, timeout=(5, 9))
         response.raise_for_status()
         return response
     except requests.RequestException:
@@ -541,19 +1275,48 @@ def _extract_feed_articles(response, source_url):
     return articles
 
 
+_DATE_TEXT_PATTERN = re.compile(
+    r"\b("
+    r"\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2,4}"        # 22/05/2026, 22-05-2026
+    r"|\d{4}[/\-.]\d{1,2}[/\-.]\d{1,2}"          # 2026-05-22
+    r"|\d{1,2}\s+(?:jan|feb|fev|mar|apr|avr|may|mai|jun|jul|aug|aou|sep|oct|nov|dec|janvier|fevrier|mars|avril|juin|juillet|aout|septembre|octobre|novembre|decembre|january|february|march|april|june|july|august|september|october|november|december)[a-z]*\s+\d{2,4}"
+    r"|(?:jan|feb|fev|mar|apr|avr|may|mai|jun|jul|aug|aou|sep|oct|nov|dec|january|february|march|april|june|july|august|september|october|november|december)[a-z]*\s+\d{1,2},?\s+\d{2,4}"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
 def _extract_card_date(card):
+    # 1. <time datetime="..."> ou <time>texte</time>
     time_node = card.find("time")
     if time_node:
         return time_node.get("datetime") or time_node.get_text(" ", strip=True)
-    for class_fragment in ["date", "time", "published", "meta", "itemdate"]:
+    # 2. Element avec class contenant un mot-cle date-related (large)
+    for class_fragment in [
+        "date", "time", "published", "publish", "meta", "itemdate",
+        "post-date", "release-date", "communique-date", "when", "timestamp"
+    ]:
         date_node = card.find(attrs={"class": re.compile(class_fragment, re.IGNORECASE)})
         if date_node:
-            return date_node.get_text(" ", strip=True)
+            text = date_node.get_text(" ", strip=True)
+            if text:
+                return text
+    # 3. Fallback : cherche une date litterale (22/05/2026, 22 mai 2026, etc.)
+    #    dans tout le texte de la card. Bcp de sites mettent juste "22 mai 2026"
+    #    dans un <span> ou <p> sans class identifiable.
+    card_text = card.get_text(" ", strip=True)
+    if card_text:
+        match = _DATE_TEXT_PATTERN.search(card_text)
+        if match:
+            return match.group(1)
     return ""
 
 
 def _extract_html_articles(soup, source_url):
     articles = []
+    # Selectors elargis pour matcher les structures presse/communiques modernes
+    # (les sites corporate utilisent souvent press-release / communique / item au
+    # lieu des classes article / news classiques).
     selectors = [
         "article",
         "div.timeline-content",
@@ -562,8 +1325,21 @@ def _extract_html_articles(soup, source_url):
         "div.post",
         "div[class*='article']",
         "div[class*='news']",
+        "div[class*='press']",
+        "div[class*='release']",
+        "div[class*='communique']",
+        "div[class*='post']",
+        "div[class*='entry']",
+        "div[class*='media-item']",
+        "div[class*='media-tile']",
         "li[class*='article']",
         "li[class*='news']",
+        "li[class*='press']",
+        "li[class*='release']",
+        "li[class*='communique']",
+        "li[class*='post']",
+        "li[class*='entry']",
+        "li[class*='item']",
     ]
     seen_nodes = set()
     for selector in selectors:
@@ -614,9 +1390,32 @@ def _scrape_media_source(source_url):
     return articles
 
 
+def _safe_scrape_media_source(source_url):
+    """Wrapper defensif : ne propage jamais d'exception (parsing HTML malforme,
+    encodage, etc.) pour qu'une seule source defaillante ne casse pas tout le
+    batch parallele. Retourne [] en cas d'erreur."""
+    try:
+        return _scrape_media_source(source_url)
+    except Exception:
+        return []
+
+
+@lru_cache(maxsize=4096)
+def _compile_keyword_pattern(keyword):
+    """Pre-compile et cache le pattern regex pour un mot-cle.
+
+    Optimisation : appele des milliers de fois (chaque article x chaque keyword).
+    Le LRU evite de re-compiler les memes patterns + factorise le fold/escape.
+    """
+    folded = _fold_media_text(keyword)
+    if not folded:
+        return None
+    return re.compile(r"(?<!\w)" + re.escape(folded) + r"(?!\w)")
+
+
 def _keyword_in_media_text(text, keyword):
-    keyword = _fold_media_text(keyword)
-    return bool(keyword and re.search(r"(?<!\w)" + re.escape(keyword) + r"(?!\w)", text))
+    pattern = _compile_keyword_pattern(keyword)
+    return bool(pattern and pattern.search(text))
 
 
 def _score_media_theme(title_text, body_text, theme):
@@ -651,23 +1450,427 @@ def _source_has_theme_hint(source_context, theme):
 
 
 def _has_enough_theme_signal(result, source_hint=False):
-    if result["strong_hits"] > 0:
-        return result["score"] >= 4
-    if result["title_medium_hits"] >= 1:
-        return result["score"] >= 3
-    if result["medium_hits"] >= 2:
-        return result["score"] >= 4
-    # Avec source hint : un seul mot-cle medium en body (2 pts) ou deux weak (2 pts) suffisent
-    if source_hint:
-        return result["score"] >= 2
+    """Verifie si un article a assez de signal pour etre rattache a un theme.
+
+    Plusieurs voies acceptees (du plus fort au plus faible) :
+      1. Au moins 1 mot strong dans le titre/body (signal direct, sans seuil de score)
+      2. Mot medium dans le titre + score >= 3
+      3. 2+ mots medium dans body + score >= 4
+      4. Avec source hint (la source est connue thematiquement) : score >= 2 suffit
+    """
+    if result["strong_hits"] >= 1:
+        return True
+    if result["title_medium_hits"] >= 1 and result["score"] >= 3:
+        return True
+    if result["medium_hits"] >= 2 and result["score"] >= 4:
+        return True
+    if source_hint and result["score"] >= 2:
+        return True
+    return False
+
+
+def _score_media_veille(title_text, body_text, veille):
+    rules = MEDIA_SCOUT_VEILLE_RULES.get(veille, {})
+    score = 0
+    strong_hits = 0
+    medium_hits = 0
+    for keyword in rules.get("strong", []):
+        if _keyword_in_media_text(title_text, keyword):
+            score += 5
+            strong_hits += 1
+        elif _keyword_in_media_text(body_text, keyword):
+            score += 4
+            strong_hits += 1
+    for keyword in rules.get("medium", []):
+        if _keyword_in_media_text(title_text, keyword):
+            score += 3
+            medium_hits += 1
+        elif _keyword_in_media_text(body_text, keyword):
+            score += 2
+            medium_hits += 1
+    for keyword in rules.get("weak", []):
+        if _keyword_in_media_text(title_text, keyword) or _keyword_in_media_text(body_text, keyword):
+            score += 1
+    return {"score": score, "strong_hits": strong_hits, "medium_hits": medium_hits}
+
+
+# ─── Filtre pre-classification : exclure articles hors scope ──────────────────
+# Applique sur le DataFrame brut AVANT _assign_media_theme.
+# Permet de garantir une stricte adhesion thematique en supprimant le bruit.
+
+# Stop-words distinctifs pour detection langue (FR vs autres latines)
+_FR_STOP = (
+    "le ", "la ", "les ", "des ", "du ", "de la ", "de l", "au ", "aux ",
+    "et ", "ou ", "qui ", "que ", "qu'", "pour ", "dans ", "avec ", "sur ",
+    "est ", "sont ", "ete ", "etre ", "selon ", "vers ", "chez ", "afin ",
+    "donc ", "alors ", "tres ", "plus ", "moins ", "leurs ", "leur ",
+    "ne ", "pas ", "n'", "c'", "d'", "l'", "j'", "m'", "t'", "s'",
+)
+_EN_STOP = (
+    "the ", "and ", "of ", "is ", "are ", "was ", "were ", "with ", "from ",
+    "for ", "this ", "that ", "these ", "those ", "have ", "has ", "had ",
+    "will ", "would ", "could ", "should ", "but ", "not ", "their ",
+    "they ", "them ", "which ", "between ", "through ", "during ", "however ",
+    "regarding ", "moreover ", "whereas ",
+)
+
+_FILTER_REMERCIEMENT_MARKERS = (
+    "remerciement", "remerciements", "remercier", "remercie", "remercions",
+    "remerciant", "merci ", "merci a ", "merci à ", "merci pour",
+    "thanks", "thank you", "thank-you", "acknowledgment", "acknowledgement",
+    "acknowledgements", "acknowledgments", "in memoriam", "hommage", "hommages",
+    "rendant hommage",
+)
+
+_FILTER_PORC_MARKERS = (
+    " porc ", " porcs ", " porcin", "porcine", "porcines", "porcs ",
+    " cochon", " cochons", "truie", "truies", "verrat", "verrats",
+    " pork ", " hog ", " hogs ", " pig ", " pigs ", " sow ", " sows ",
+    " swine", "boar ", "filiere porcine", "filiere porc", "filiere porcin",
+    "elevage porcin", "elevage de porcs", "viande de porc", "viande porc",
+    "porkers", "pigprogress",
+)
+
+# Filtre animaux hors scope T2 Elevage (ovins/bovins/caprins/volailles uniquement)
+# Note 1 : on garde "miel" (epicerie fine T3) mais on filtre apiculture/elevage abeilles
+# Note 2 : on RETIRE chameau/dromadaire/buffle car ces especes apparaissent souvent
+# en mention secondaire dans des articles legitimes sur l'elevage au Maghreb
+# (ex: "marche du betail incluant ovins et dromadaires").
+_FILTER_OTHER_ANIMALS_MARKERS = (
+    # Equides (focus competition, sport, viande -> hors scope LDA)
+    " cheval ", " chevaux ", " jument", " etalon", " poney", " poulain",
+    "equin ", "equine", "equidé", "equide", "filiere equine", "elevage equin",
+    "viande de cheval", "viande chevaline",
+    # Apiculture (elevage d'abeilles - distinct de miel produit fini)
+    "apicult", "apiculteur", "apicultrice", "elevage d'abeilles", "elevage abeille",
+    "ruche", "ruches", "filiere apicole",
+    # Pisciculture / aquaculture
+    "pisciculture", "piscicole", "aquaculture", "salmoniculture",
+    "elevage piscicole", "ferme aquacole", "fish farming", "elevage de poissons",
+    "filiere aquacole", "filiere piscicole",
+    # Cunicole (lapin)
+    " lapin ", " lapins ", "cuniculture", "cunicole", "filiere cunicole",
+    " lievre ", " lievres ", "elevage cunicole", "viande de lapin",
+    # Pets / animaux de compagnie
+    " chien ", " chiens ", "petfood", "pet food", "animal de compagnie",
+    "animaux de compagnie", "elevage canin", "filiere petfood",
+    # Gibier sauvage (rarement le focus principal)
+    " cerf ", " cerfs ", "daim ", " sanglier",
+    "elevage de gibier", "gibier d'elevage",
+    # Insectes (elevage)
+    "elevage d'insectes", "elevage insectes", "filiere insectes",
+)
+
+_FILTER_JOB_MARKERS = (
+    "offre d emploi", "offre d'emploi", "offres d'emploi", "offres d emploi",
+    "recrute", "recrutement", "recrutent", "recruter", "recrutons",
+    "job offer", "job offers", "we are hiring", "we re hiring", "we're hiring",
+    "hiring now", "carriere", "carrieres", "candidature", "candidatures",
+    "envoyez votre cv", "envoyer cv", "poste a pourvoir", "postes a pourvoir",
+    "intitule du poste", "fiche de poste", "stage etudiant", "alternance",
+    "apprentissage", "rejoignez-nous", "rejoignez nous", "join our team",
+    "join us", "join the team", "open positions", "open roles",
+    "talents recherches", "recherche profil", "embauche",
+)
+
+_FILTER_AUTO_MARKERS = (
+    "automobile", "automotive", "voiture", "voitures", "vehicule auto",
+    "vehicules automobile", "auto-moto", "auto moto", "constructeur auto",
+    "constructeur automobile", "industrie automobile",
+    "salon de l auto", "salon de l'auto", "salon auto",
+    "renault", "peugeot", "citroen", "stellantis", "tesla", "byd auto",
+    "audi", "bmw", "mercedes", "toyota", "volkswagen", "porsche", "ferrari",
+    "fiat", "hyundai", "kia", "honda", "nissan", "mazda", "suzuki", "chery",
+    "leapmotor", "nio", "xpeng", "lucid motors", "rivian",
+    "concessionnaire auto", "showroom automobile",
+    "vehicule electrique", "voiture electrique", "bornes de recharge",
+    "moteur thermique", "moteur diesel", "moteur essence",
+    "f1 ", "formule 1", "moto gp", "rallye dakar",
+)
+
+_FILTER_HEALTH_PURE_MARKERS = (
+    # Pathologies / cliniques (sans lien direct alimentaire/agro/SST)
+    "covid-19", "covid 19", "coronavirus", "vaccin covid", "vaccination covid",
+    "vaccin grippe", "grippe saisonniere", "rougeole", "varicelle", "rubeole",
+    "tuberculose", "diabete chronique", "cancer du sein", "cancer prostate",
+    "cancer colorectal", "maladie cardiovasculaire", "infarctus", "avc cerebral",
+    "infection nosocomiale", "alzheimer", "parkinson", "sclerose en plaques",
+    "depression nerveuse", "trouble anxieux", "trouble bipolaire",
+    "schizophrenie", "autisme",
+    # Sante reproductive / pediatrique
+    "fertilite", "pma fiv", "grossesse", "accouchement", "pediatrie",
+    "obstetrique", "gynecologie",
+    # Pharma medicaments
+    "essai clinique", "medicament generique", "ema medicament",
+    "approbation fda medicament",
+)
+
+_FILTER_HEALTH_WHITELIST_MARKERS = (
+    # Si l'article mentionne ces termes, on NE filtre PAS (pertinent agro/QSE/SST)
+    "alimentaire", "alimentation", "agriculture", "agricole", "agro", "elevage",
+    "filiere", "production", "transformation", "rse", "qse", "sst",
+    "securite au travail", "occupational health", "iso 22000", "iso 45001",
+    "iso 14001", "haccp", "norme", "regulation", "reglement", "directive",
+    "environnement", "climat", "energie", "eau", "export",
+    "marche", "filiere agricole", "filiere viande", "filiere laitiere",
+    "residus", "pesticide", "pesticides", "phytosanitaire", "contamination",
+    "rappel produit", "retrait produit", "tracabilite",
+)
+
+_FILTER_OTHER_COUNTRY_MARKERS = (
+    # Pays africains autres
+    "egypte", "egypt", "tunisie", "algerie", "libye", "soudan", "mauritanie",
+    "senegal", "cote d'ivoire", "cote d ivoire", "ivory coast", "ghana",
+    "nigeria", "kenya", "ethiopie", "afrique du sud", "south africa",
+    "rdc ", "republique democratique du congo", "congo ", "cameroun",
+    # Ameriques
+    "etats-unis", "etats unis", "usa ", "us economy", "americain", "american",
+    "canada ", "canadien", "mexique", "mexico", "bresil", "brazil",
+    "argentina", "argentine", "chili", "perou", "colombie", "venezuela",
+    # Asie
+    "chine ", "china ", "chinese", "chinois", "pekin", "shanghai", "hong kong",
+    "inde ", "india ", "indien", "indian", "new delhi", "mumbai",
+    "japon", "japan", "japonais", "japanese", "tokyo",
+    "coree du sud", "south korea", "seoul", "coreen",
+    "thailande", "vietnam", "indonesie", "malaisie", "philippines",
+    "singapour", "singapore", "taiwan",
+    # Europe (pays specifiques, hors UE generique)
+    "russie", "russia", "russian", "russe", "moscou",
+    "ukraine", "ukrainien",
+    "turquie", "turkey", "turc", "istanbul", "ankara",
+    # Australie / Pacifique
+    "australie", "australia", "nouvelle-zelande", "new zealand",
+)
+
+
+def _is_french_or_english(text: str) -> bool:
+    """Heuristique : detecte si un texte est en francais ou anglais.
+
+    1. Rejette les scripts non-latins (Arabe, Chinois, Cyrillique, Hebreu, etc.)
+    2. Parmi les scripts latins, exige au moins 2 stop-words FR ou EN distinctifs
+    Sinon -> probable autre langue (espagnol/allemand/italien/portugais) -> rejet.
+    """
+    if not text or len(text.strip()) < 8:
+        return True  # texte trop court : on garde par defaut
+    # Detection scripts non-latins (rejet immediat)
+    for ch in text[:300]:  # check les 300 premiers chars suffit
+        if ch.isalpha():
+            o = ord(ch)
+            # Arabe (0600-06FF), Cyrillique (0400-04FF), Hebreu (0590-05FF),
+            # CJK (3400+), Hiragana/Katakana, Devanagari, Thai, Coreen
+            if (0x0600 <= o <= 0x06FF or 0x0400 <= o <= 0x04FF or
+                0x0590 <= o <= 0x05FF or 0x3400 <= o <= 0x9FFF or
+                0x3040 <= o <= 0x30FF or 0x0900 <= o <= 0x097F or
+                0x0E00 <= o <= 0x0E7F or 0xAC00 <= o <= 0xD7AF):
+                return False
+    # Comptage stop-words FR / EN (distinctifs)
+    lower = " " + text.lower() + " "
+    fr_hits = sum(1 for m in _FR_STOP if m in lower)
+    en_hits = sum(1 for m in _EN_STOP if m in lower)
+    # Au moins 2 stop-words dans une des 2 langues
+    return fr_hits >= 2 or en_hits >= 2
+
+
+def _should_exclude_article(row) -> bool:
+    """Filtre pre-classification : exclut les articles hors scope.
+
+    Exclusions :
+      - Langue autre que FR/EN
+      - Articles de remerciement / hommages
+      - News porcines (hors scope Elevage = ovin/bovin/caprin/volaille)
+      - Offres d'emploi / recrutement
+      - Automobile / industrie auto
+      - Sante 'pure' (pathologies, vaccins) sans contexte agro/QSE/SST
+      - Mentions d'ONCF (rail marocain hors scope)
+      - Pour sources marocaines : articles qui parlent uniquement d'un autre pays
+    Retourne True si l'article doit etre exclu.
+    """
+    title_raw = str(row.get("Title", ""))
+    desc_raw = str(row.get("Description", ""))
+    full_raw = title_raw + " " + desc_raw
+
+    # Filtre 0 : langue (FR/EN uniquement)
+    if not _is_french_or_english(full_raw):
+        return True
+
+    title = _fold_media_text(title_raw)
+    desc = _fold_media_text(desc_raw)
+    text = title + " " + desc
+
+    # Filtre 1 : remerciements / hommages
+    if any(m in text for m in _FILTER_REMERCIEMENT_MARKERS):
+        return True
+
+    # Filtre 2 : porc / cochon (hors scope T2 Elevage)
+    # On entoure le texte d'espaces pour matcher les mots entiers
+    padded = " " + text + " "
+    if any(m in padded for m in _FILTER_PORC_MARKERS):
+        return True
+
+    # Filtre 2bis : autres animaux hors scope T2 (cheval, abeille, poisson, lapin,
+    # chien/chat, chameau, buffle, cerf, insectes...)
+    if any(m in padded for m in _FILTER_OTHER_ANIMALS_MARKERS):
+        return True
+
+    # Filtre 3 : offres d'emploi
+    if any(m in text for m in _FILTER_JOB_MARKERS):
+        return True
+
+    # Filtre 4 : automobile
+    if any(m in text for m in _FILTER_AUTO_MARKERS):
+        return True
+
+    # Filtre 5 : ONCF (rail Maroc hors scope LDA)
+    if "oncf" in text or "office national des chemins de fer" in text:
+        return True
+
+    # Filtre 6 : sante 'pure' sans lien agro/QSE/SST
+    has_pure_health = any(m in text for m in _FILTER_HEALTH_PURE_MARKERS)
+    has_whitelist = any(m in text for m in _FILTER_HEALTH_WHITELIST_MARKERS)
+    if has_pure_health and not has_whitelist:
+        return True
+
+    # Filtre 7 : sources marocaines parlant d'un autre pays SANS mention Maroc
+    website = str(row.get("Website_name", ""))
+    is_maroc_source = MEDIA_SCOUT_SOURCE_ZONES.get(website) == "MAROC"
+    if is_maroc_source:
+        has_other_country = any(c in text for c in _FILTER_OTHER_COUNTRY_MARKERS)
+        has_maroc = any(
+            m in text
+            for m in ("maroc", "morocco", "marocain", "marocaine", "maghreb")
+        )
+        if has_other_country and not has_maroc:
+            return True
+
+    return False
+
+
+# Especes betail strictement dans le scope T2 (ovins/bovins/caprins/volailles).
+# Garde-fou : un article classe T2 DOIT contenir au moins UNE de ces mentions
+# en titre ou description, sinon il est demote en "Autres" (evite les faux
+# positifs type "oléiculteurs", "élevés" adjectif, etc.).
+_T2_LIVESTOCK_SPECIES = (
+    # Ovins
+    "ovin", "ovins", "ovine", "mouton", "moutons", "agneau", "agneaux",
+    "brebis", "belier", "beliers",
+    # Bovins
+    "bovin", "bovins", "bovine", "vache", "vaches", "veau", "veaux",
+    "boeuf", "boeufs", "taureau", "genisse", "genisses", "cattle",
+    # Caprins
+    "caprin", "caprins", "caprine", "chevre", "chevres", "chevreau", "bouc",
+    # Volailles
+    "volaille", "volailles", "poulet", "poulets", "poule", "poules", "poussin",
+    "dinde", "dindes", "canard", "canards", "oie", "oies", "pintade",
+    "caille", "broiler", "poultry", "aviculture", "avicole",
+    # Cheptel / generic livestock
+    "cheptel", "betail", "livestock", "troupeau", "troupeaux",
+    # Filiere viande
+    "viande", "viandes", "meat", "abattoir", "abattoirs", "abattage",
+    "slaughterhouse", "boucherie",
+    # Evenement Aïd (= marche ovin)
+    "aid al adha", "aid el adha", "aid el kebir", "aid kebir",
+    "aid adha", "eid al adha", "eid el kebir", "fete du sacrifice",
+    "sacrifice du mouton", "tabaski", "souk al kbach", "souk kbach",
+    # Federations
+    "anoc", "fivob", "fisa ", "fimabe", "interprovi", "sonacos",
+)
+
+
+def _has_livestock_species(title_folded: str, body_folded: str) -> bool:
+    """True si le texte mentionne au moins une espece betail / contexte direct.
+
+    Utilise word-boundary matching pour eviter les faux matchs.
+    """
+    for species in _T2_LIVESTOCK_SPECIES:
+        if _keyword_in_media_text(title_folded, species):
+            return True
+        if _keyword_in_media_text(body_folded, species):
+            return True
+    return False
+
+
+# Pays africains/Maghreb NON-Maroc : focus geographique non pertinent pour T2.
+# Garde les articles UE / WW (qui peuvent affecter exports Maroc), mais filtre
+# ceux dont le sujet principal est un pays voisin/africain autre.
+_T2_AFRICA_NON_MAROC = (
+    # Maghreb non-Maroc
+    "mauritanie", "mauritanien", "mauritanienne", "mauritania", "mauritanian",
+    "algerie", "algerien", "algerienne", "algeria", "algerian",
+    "tunisie", "tunisien", "tunisienne", "tunisia", "tunisian",
+    "libye", "libyen", "libyenne", "libya", "libyan",
+    # Afrique de l'Ouest (marches separes du Maroc)
+    "senegal", "senegalais", "senegalaise",
+    "mali ", "malien", "malienne",
+    "burkina faso", "burkinabe",
+    "cote d'ivoire", "cote d ivoire", "ivory coast", "ivoirien", "ivoirienne",
+    "niger ", "nigerien", "nigerienne",
+    "ghana ", "ghaneen", "ghaneenne", "ghanaian",
+    "nigeria", "nigerian",
+    # Afrique subsaharienne (autres)
+    "ethiopie", "ethiopien", "ethiopian",
+    "kenya", "kenyan",
+    "tanzanie", "tanzanien",
+    "rwanda", "rwandais",
+    "ouganda", "ugandan",
+    "congo ", "congolais",
+    "cameroun", "camerounais",
+)
+
+_T2_MAROC_MARKERS = (
+    "maroc", "morocco", "marocain", "marocaine", "moroccan",
+    "rabat", "casablanca", "tanger", "fes ", "marrakech", "agadir",
+)
+
+
+def _t2_is_foreign_focused(title_folded: str) -> bool:
+    """True si le titre cible un pays etranger africain SANS focus Maroc.
+
+    Regle : un article est "foreign focused" si :
+    - Le titre contient un marker pays africain non-Maroc ; ET
+    - Soit Maroc n'apparait pas du tout dans le titre ;
+    - Soit le pays etranger apparait AVANT Maroc dans le titre (= sujet principal)
+
+    Garde les articles type "Maroc importe du Senegal", "Maroc-Algerie...".
+    Filtre les articles type "Mauritanie : prix moutons", "Race algerienne au Maroc".
+    """
+    foreign_pos = -1
+    for marker in _T2_AFRICA_NON_MAROC:
+        idx = title_folded.find(marker)
+        if idx >= 0 and (foreign_pos < 0 or idx < foreign_pos):
+            foreign_pos = idx
+    if foreign_pos < 0:
+        return False  # aucune mention pays africain non-MA
+
+    maroc_pos = -1
+    for marker in _T2_MAROC_MARKERS:
+        idx = title_folded.find(marker)
+        if idx >= 0 and (maroc_pos < 0 or idx < maroc_pos):
+            maroc_pos = idx
+
+    # Si Maroc absent du titre -> sujet est le pays etranger -> exclure
+    if maroc_pos < 0:
+        return True
+    # Si pays etranger apparait AVANT Maroc -> sujet principal est le pays etranger
+    if foreign_pos < maroc_pos:
+        return True
     return False
 
 
 def _assign_media_theme(row):
+    """Classification par mots-cles avec fallbacks defensifs.
+
+    Voies de classification (du plus fort au plus faible) :
+      1. Scoring keyword : au moins 1 strong OU title-medium OU 2 medium
+      2. Domain override : URL host connue (onssa.gov.ma -> T1, afnor.org -> T5, etc.)
+      3. Forced source theme : source mono-thematique (ex: AgriMaroc -> T1)
+      4. 'Autres' (sera filtre en aval)
+
+    Garde-fou T2 : si l'article est classe Elevage MAIS ne mentionne aucune
+    espece betail dans titre/description, on le re-route (vers le 2eme best
+    candidate ou "Autres"). Evite les faux positifs (oléiculteurs, etc.).
+    """
     website_name = str(row.get("Website_name", ""))
     link_host = urlparse(str(row.get("Link", ""))).netloc.lower().replace("www.", "")
-    if any(domain in link_host for domain in MEDIA_SCOUT_REFERENTIAL_SOURCE_DOMAINS):
-        return "RSE & Referentiels"
 
     source_context = _fold_media_text(" ".join([website_name, str(row.get("Link", ""))]))
     title_text = _fold_media_text(row.get("Title", ""))
@@ -679,27 +1882,209 @@ def _assign_media_theme(row):
         if _has_enough_theme_signal(result, _source_has_theme_hint(source_context, theme)):
             candidates[theme] = result
 
-    if not candidates:
-        # Fallback : thematique forcee pour les sources 100% specialisees
-        forced = MEDIA_SCOUT_FORCED_SOURCE_THEMES.get(website_name)
-        return forced if forced else "Autres"
+    T2 = "Elevage (Ovins, Bovins, Caprins, Volailles)"
 
-    best = max(candidates.items(), key=lambda item: (item[1]["strong_hits"], item[1]["medium_hits"], item[1]["score"]))[0]
-    if best in ("Referentiels RSE", "Responsabilite Sociale des Entreprises"):
-        return "RSE & Referentiels"
+    # Helper : verifie qu'un candidat T2 passe les 2 gardes (especes + geo)
+    def _t2_passes_guards():
+        if not _has_livestock_species(title_text, body_text):
+            return False
+        if _t2_is_foreign_focused(title_text):
+            return False
+        return True
+
+    if candidates:
+        sorted_candidates = sorted(
+            candidates.items(),
+            key=lambda item: (item[1]["strong_hits"], item[1]["medium_hits"], item[1]["score"]),
+            reverse=True,
+        )
+        best = sorted_candidates[0][0]
+        # Garde-fou T2 : reroute si pas d'espece OU focus pays etranger
+        if best == T2 and not _t2_passes_guards():
+            if len(sorted_candidates) > 1:
+                return sorted_candidates[1][0]
+            return "Autres"
+        return best
+
+    # Fallback 1 : override par domaine (pour les regulateurs/specialistes
+    # dont 99% des articles sont sur leur theme par definition).
+    for domain, theme in MEDIA_SCOUT_DOMAIN_THEME_OVERRIDES.items():
+        if domain in link_host:
+            # Garde-fou T2 sur domain override aussi
+            if theme == T2 and not _t2_passes_guards():
+                continue
+            return theme
+
+    # Fallback 2 : theme force pour les sources mono-thematiques
+    # (ex: AgriMaroc -> T1, ONSSA -> T1, AMMC -> T5)
+    forced = MEDIA_SCOUT_FORCED_SOURCE_THEMES.get(website_name)
+    if forced:
+        # Garde-fou T2 : meme une source force-T2 verifie especes + focus geo.
+        if forced == T2 and not _t2_passes_guards():
+            return "Autres"
+        return forced
+
+    return "Autres"
+
+
+def _assign_media_veille(row):
+    """Classifie l'article dans l'une des 4 Veilles.
+
+    Veille Informative est le defaut (fallback) si aucun signal des autres
+    Veilles n'est suffisant. Reglementaire > Concurrentielle > Evenementielle
+    en cas d'egalite de score (les regulations priment sur les annonces business).
+    """
+    title_text = _fold_media_text(row.get("Title", ""))
+    body_text = _fold_media_text(" ".join([
+        str(row.get("Description", "")),
+        str(row.get("Title", "")),
+    ]))
+
+    veille_priority = ["Veille Reglementaire", "Veille Concurrentielle", "Veille Evenementielle"]
+    candidates = {}
+    for veille in veille_priority:
+        result = _score_media_veille(title_text, body_text, veille)
+        # Une Veille est candidate s'il y a au moins un strong hit OU au moins 2 medium hits.
+        if result["strong_hits"] >= 1 or result["medium_hits"] >= 2:
+            candidates[veille] = result
+
+    if not candidates:
+        return "Veille Informative"
+
+    # Tie-break: strong_hits, medium_hits, score, puis ordre de priorite
+    def sort_key(item):
+        veille, result = item
+        return (result["strong_hits"], result["medium_hits"], result["score"],
+                -veille_priority.index(veille))
+    best = max(candidates.items(), key=sort_key)[0]
     return best
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def data_media_scout(urls=None):
+def _is_morocco_relevant(row):
+    """Garde l'article si Maroc-relevant (direct ou impact potentiel).
+
+    Regles :
+    - Source zone MAROC -> garde toujours
+    - Marqueur Maroc direct (titre/desc) -> garde
+    - Marqueur portee large (UE-wide, ISO, FAO, ESG, climat...) -> garde
+    - Marqueur pays-specifique (France/UK/US-state/etc.) sans marqueur positif -> drop
+    - Pas de signal clair -> garde par defaut (eviter les faux negatifs)
+    """
+    zone = MEDIA_SCOUT_SOURCE_ZONES.get(row.get("Website_name", ""), "")
+    if zone == "MAROC":
+        return True
+
+    text = _fold_media_text(" ".join([
+        str(row.get("Title", "")),
+        str(row.get("Description", "")),
+    ]))
+    if not text:
+        return True
+
+    has_maroc = any(marker in text for marker in MEDIA_SCOUT_MOROCCO_DIRECT_MARKERS)
+    if has_maroc:
+        return True
+
+    has_broad_scope = any(marker in text for marker in MEDIA_SCOUT_BROAD_SCOPE_MARKERS)
+    has_country_specific = any(marker in text for marker in MEDIA_SCOUT_COUNTRY_SPECIFIC_MARKERS)
+
+    # Marqueur pays-specifique present sans portee large -> drop (news purement domestique)
+    if has_country_specific and not has_broad_scope:
+        return False
+
+    # Si portee large OU rien de pays-specifique -> garde
+    return True
+
+
+def _should_keep_article(row):
+    """Filtre combine applique apres classification theme/veille."""
+    return _is_morocco_relevant(row)
+
+
+# ─── Cache schedule (refresh aux heures fixes Maroc) ──────────────────────────
+# Le scraping global se rafraichit a CES heures (heure locale Maroc) :
+SCHEDULED_REFRESH_HOURS = [7, 19]  # 07h00 et 19h00 (modifiable)
+try:
+    _TZ_MAROC = ZoneInfo("Africa/Casablanca")
+except Exception:
+    # Fallback Windows sans tzdata : UTC+1 fixe (Maroc reste sur UTC+1 toute l'annee)
+    from datetime import timezone
+    _TZ_MAROC = timezone(timedelta(hours=1), name="Africa/Casablanca")
+
+
+# Bumper cette version a chaque modification de la taxonomie (themes, keywords, sources).
+# Inclus dans le slot de cache -> invalide automatiquement le DataFrame en cache et
+# force un re-scraping a la prochaine execution.
+_TAXONOMY_VERSION = "v22"
+
+
+def current_cache_slot() -> str:
+    """Retourne un identifiant de creneau qui change aux heures programmees.
+
+    Ex : entre 07h00 et 18h59 -> 'YYYY-MM-DD-07h-v3'
+         entre 19h00 et 06h59 -> 'YYYY-MM-DD-19h-v3'
+
+    Utilise comme parametre de cache de data_media_scout : quand le creneau OU la
+    version de taxonomie change, la cle de cache change -> Streamlit re-execute
+    la fonction -> nouveau scraping + re-classification.
+    """
+    now = _datetime_maroc()
+    hour = now.hour
+    passed_hours = [h for h in SCHEDULED_REFRESH_HOURS if hour >= h]
+    if passed_hours:
+        last_hour = max(passed_hours)
+        slot_date = now.strftime("%Y-%m-%d")
+    else:
+        # Avant la 1ere heure du jour -> on est dans le creneau du jour precedent (derniere heure)
+        last_hour = max(SCHEDULED_REFRESH_HOURS)
+        slot_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    return f"{slot_date}-{last_hour:02d}h-{_TAXONOMY_VERSION}"
+
+
+def _datetime_maroc() -> datetime:
+    """Retourne datetime.now() en heure locale Maroc (gere les DST)."""
+    return datetime.now(_TZ_MAROC)
+
+
+@st.cache_data(show_spinner=False)  # cle = slot (meme que data_media_scout)
+def media_scrape_timestamp(slot: str = "") -> datetime:
+    """Horodatage reel de la derniere collecte de donnees (heure Maroc).
+
+    Mise en cache par 'slot' (meme cle que data_media_scout) : la valeur est
+    figee au PREMIER acces de chaque creneau — c.-a-d. au moment ou le scraping
+    reel se produit — puis reutilisee jusqu'au prochain creneau. Reflete donc
+    fidelement la derniere mise a jour effective des donnees affichees.
+
+    A appeler avec le meme slot que data_media_scout : current_cache_slot().
+    """
+    return _datetime_maroc()
+
+
+def format_last_update(dt: datetime) -> str:
+    """Formate un datetime en 'JJ/MM/YYYY · HHhMM' pour affichage filterbar."""
+    if dt is None:
+        return ""
+    return dt.strftime("%d/%m/%Y · %Hh%M")
+
+
+@st.cache_data(show_spinner=False)  # TTL pilote par slot (cf. current_cache_slot)
+def data_media_scout(urls=None, slot: str = ""):
+    """Scraping global. La param 'slot' fait partie de la cle de cache : son
+    changement (declenche a 07h00 / 19h00) force un re-scraping. Le slot a
+    passer est current_cache_slot() — fournit par l'app au moment de l'appel."""
     urls = urls or MEDIA_SCOUT_URLS
     source_urls = [source["URL"] if isinstance(source, dict) else source for source in urls]
 
+    # Scraping PARALLELE : les ~90 sources sont fetchees concurremment (I/O reseau
+    # => le GIL est libere pendant les requetes). Une source lente/morte ne bloque
+    # plus les autres. Speedup typique 5-10x vs boucle sequentielle.
     data = []
-    for source_url in source_urls:
-        data.extend(_scrape_media_source(source_url))
+    max_workers = min(24, len(source_urls)) or 1
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for articles in executor.map(_safe_scrape_media_source, source_urls):
+            data.extend(articles)
 
-    columns = ["Date", "Title", "Description", "Link", "Website_name", "Theme"]
+    columns = ["Date", "Title", "Description", "Link", "Website_name", "Theme", "Veille"]
     if not data:
         empty_df = pd.DataFrame(columns=columns)
         empty_df["Date"] = pd.to_datetime(empty_df["Date"])
@@ -709,8 +2094,36 @@ def data_media_scout(urls=None):
     df["Date"] = df["Date"].apply(_normalize_media_date)
     df["Date"] = pd.to_datetime(df["Date"], format="%d/%m/%Y", errors="coerce")
     df = df.dropna(subset=["Date", "Title", "Link"])
+    # Filtre pre-classification : exclure offres emploi, auto, sante pure, ONCF, non-Maroc
+    df = df[~df.apply(_should_exclude_article, axis=1)]
+    if df.empty:
+        empty_df = pd.DataFrame(columns=columns)
+        empty_df["Date"] = pd.to_datetime(empty_df["Date"])
+        return empty_df
     df["Theme"] = df.apply(_assign_media_theme, axis=1)
-    df = df[df["Theme"].isin(MEDIA_SCOUT_ALLOWED_THEMES)]
+    df = df[df["Theme"].isin(MEDIA_SCOUT_THEMES)]
+
+    if df.empty:
+        empty_df = pd.DataFrame(columns=columns)
+        empty_df["Date"] = pd.to_datetime(empty_df["Date"])
+        return empty_df
+
+    # ── Validation LLM par theme : juge si le titre est strictement lie au theme ──
+    # Cette couche capture les articles qui matchent les keywords mais sont en realite
+    # off-topic. Erreur safe : si LLM echoue, on garde tout (pas de perte de donnees).
+    df = _llm_validate_themes(df)
+
+    if df.empty:
+        empty_df = pd.DataFrame(columns=columns)
+        empty_df["Date"] = pd.to_datetime(empty_df["Date"])
+        return empty_df
+
+    df["Veille"] = df.apply(_assign_media_veille, axis=1)
+
+    # Filtres post-classification :
+    # 1) Pertinence Maroc (direct ou impact potentiel via EU/WORLD)
+    # 2) Pour le theme IA, garde uniquement les news "WAW" (modeles, decouvertes), drop infra
+    df = df[df.apply(_should_keep_article, axis=1)]
 
     if df.empty:
         empty_df = pd.DataFrame(columns=columns)
@@ -722,98 +2135,921 @@ def data_media_scout(urls=None):
     df = df.drop_duplicates(subset=["_link_key"])
     df = df.drop_duplicates(subset=["_title_key"])
     df = df.drop(columns=["_title_key", "_link_key"])
-    df["Theme"] = pd.Categorical(df["Theme"], categories=MEDIA_SCOUT_ALLOWED_THEMES, ordered=True)
-    df = df.sort_values(["Theme", "Date"], ascending=[True, False])
+    df["Theme"] = pd.Categorical(df["Theme"], categories=MEDIA_SCOUT_THEMES, ordered=True)
+    df["Veille"] = pd.Categorical(df["Veille"], categories=MEDIA_SCOUT_VEILLES, ordered=True)
+    df = df.sort_values(["Veille", "Theme", "Date"], ascending=[True, True, False])
     return df[columns]
 
 
-MEDIA_SCOUT_WEATHER_CITIES = {
-    "Oujda":      (34.68, -1.91),
-    "Fes":        (34.04, -5.00),
-    "Casablanca": (33.59, -7.62),
-    "Marrakech":  (31.63, -8.00),
-    "Agadir":     (30.43, -9.60),
-    "Dakhla":     (23.71, -15.94),
-}
+# ─── LLM multi-provider failover (Google Gemini + Groq) ──────────────────────
+# Permet d'utiliser plusieurs providers LLM avec plusieurs cles API par provider
+# (free tier limite). Priorite : Google Gemini d'abord, puis Groq. Quand une cle
+# atteint son rate limit, on passe a la suivante. Apres 60s de cooldown, la cle
+# epuisee redevient utilisable.
+#
+# Architecture :
+#   - _LLM_PROVIDERS : tuple ordonne (provider, secret_name, default_model)
+#   - _LLM_EXHAUSTED : dict global { secret_name -> datetime cooldown_end }
+#   - _llm_chat_with_failover() : interface unifiee retournant un objet
+#       OpenAI-compatible (response.choices[0].message.content)
+#   - _groq_chat_with_failover : alias retro-compat -> _llm_chat_with_failover
+
+# Ordre de priorite : Google d'abord (free tier plus genereux), Groq en backup
+_LLM_PROVIDERS = (
+    ("google", "GOOGLE_API_KEY",   "gemini-3.5-flash"),
+    ("google", "GOOGLE_API_KEY_1", "gemini-3.5-flash"),
+    ("groq",   "GROQ_API_KEY",     "llama-3.3-70b-versatile"),
+    ("groq",   "GROQ_API_KEY_1",   "llama-3.3-70b-versatile"),
+)
+
+# Module-level dict (partage entre toutes les sessions Streamlit du process)
+# secret_name -> datetime jusqu'auquel la cle est marquee comme epuisee
+_LLM_EXHAUSTED = {}
+
+# Retro-compat : ancien nom encore utilise par certains call sites
+_GROQ_EXHAUSTED = _LLM_EXHAUSTED
+_GROQ_KEY_NAMES = ("GROQ_API_KEY", "GROQ_API_KEY_1")
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_scout_weather() -> dict:
-    """Temperatures min/max et pluviometrie du jour via Open-Meteo."""
-    results = {}
-    for city, (lat, lon) in MEDIA_SCOUT_WEATHER_CITIES.items():
-        try:
-            url = (
-                f"https://api.open-meteo.com/v1/forecast"
-                f"?latitude={lat}&longitude={lon}"
-                f"&daily=temperature_2m_max,temperature_2m_min,precipitation_sum"
-                f"&timezone=Africa%2FCasablanca&forecast_days=1"
-            )
-            resp = requests.get(url, timeout=8)
-            resp.raise_for_status()
-            data = resp.json()
-            results[city] = {
-                "min":    round(data["daily"]["temperature_2m_min"][0]),
-                "max":    round(data["daily"]["temperature_2m_max"][0]),
-                "precip": round(data["daily"]["precipitation_sum"][0], 1),
-            }
-        except Exception:
-            pass
-    return results
+def _get_secret_or_env(name: str):
+    """Recupere une valeur depuis st.secrets en priorite, sinon os.environ."""
+    try:
+        v = st.secrets.get(name)
+        if v:
+            return v
+    except Exception:
+        pass
+    return os.getenv(name)
+
+
+def _get_groq_api_keys() -> list:
+    """Liste des cles API Groq disponibles (retro-compat)."""
+    keys = []
+    for name in _GROQ_KEY_NAMES:
+        v = _get_secret_or_env(name)
+        if v and v not in keys:
+            keys.append(v)
+    return keys
 
 
 def _get_groq_api_key():
+    """Retro-compat : retourne la premiere cle Groq disponible (ou None)."""
+    keys = _get_groq_api_keys()
+    return keys[0] if keys else None
+
+
+def _get_available_llm_providers() -> list:
+    """Liste des entrees (provider, secret_name, model, key_value) configurees.
+
+    Filtre les entrees sans cle valable et celles dont le SDK n'est pas dispo
+    (ex: google-genai non installe).
+    """
+    out = []
+    for provider, secret_name, model in _LLM_PROVIDERS:
+        if provider == "google" and not _GENAI_AVAILABLE:
+            continue
+        key = _get_secret_or_env(secret_name)
+        if not key:
+            continue
+        out.append((provider, secret_name, model, key))
+    return out
+
+
+def _has_any_llm_key() -> bool:
+    """True si au moins une cle LLM (Google ou Groq) est configuree."""
+    return bool(_get_available_llm_providers())
+
+
+def _is_key_available(secret_name: str) -> bool:
+    """True si la cle n'est pas marquee comme epuisee (ou si cooldown expire)."""
+    if secret_name not in _LLM_EXHAUSTED:
+        return True
+    if datetime.now() >= _LLM_EXHAUSTED[secret_name]:
+        del _LLM_EXHAUSTED[secret_name]
+        return True
+    return False
+
+
+def _mark_key_exhausted(secret_name: str, cooldown_seconds: int = 60):
+    """Marque une cle comme epuisee pendant `cooldown_seconds` (defaut 60s)."""
+    _LLM_EXHAUSTED[secret_name] = datetime.now() + timedelta(seconds=cooldown_seconds)
+
+
+def _wrap_llm_response(content: str):
+    """Wrappe un texte en objet OpenAI-compatible (response.choices[0].message.content)."""
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content=content or "")
+            )
+        ]
+    )
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    """Detecte un rate-limit / quota a partir du texte d'exception."""
+    err = str(exc).lower()
+    return (
+        "rate_limit" in err
+        or "rate limit" in err
+        or "ratelimit" in err
+        or "429" in err
+        or "too many requests" in err
+        or "quota" in err
+        or "resource_exhausted" in err
+        or "resource exhausted" in err
+        or "tokens per minute" in err
+        or "requests per minute" in err
+    )
+
+
+def _call_groq_provider(api_key, model, messages, max_tokens, temperature, **kwargs):
+    """Appel Groq retournant un objet OpenAI-compatible."""
+    client = Groq(api_key=api_key)
+    return client.chat.completions.create(
+        model=model,
+        messages=messages,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        **kwargs,
+    )
+
+
+def _call_gemini_provider(api_key, model, messages, max_tokens, temperature, **kwargs):
+    """Appel Google Gemini (SDK google-genai >=2.x) retournant un objet OpenAI-compatible.
+
+    Convertit les messages OpenAI-style (role=system/user/assistant) au format
+    google-genai :
+      - role=system → config.system_instruction (concat de tous les system)
+      - role=assistant → role=model dans `contents`
+      - role=user → role=user dans `contents`
+    Utilise client.models.generate_content(model=..., contents=..., config=...).
+    """
+    if not _GENAI_AVAILABLE:
+        raise RuntimeError("google-genai non installe")
+
+    client = _genai.Client(api_key=api_key)
+
+    # Separe system prompt (concat de tous les role=system) du reste
+    system_parts = []
+    contents = []
+    for m in messages:
+        role = (m.get("role") or "").lower()
+        content = m.get("content") or ""
+        if role == "system":
+            system_parts.append(content)
+        elif role == "assistant":
+            contents.append({"role": "model", "parts": [{"text": content}]})
+        else:  # user (defaut)
+            contents.append({"role": "user", "parts": [{"text": content}]})
+
+    system_instruction = "\n\n".join(p for p in system_parts if p) or None
+
+    # Build config (GenerateContentConfig). Le SDK accepte aussi un dict.
+    config_kwargs = {
+        "temperature": float(temperature) if temperature is not None else 0.4,
+        "max_output_tokens": int(max_tokens) if max_tokens else 500,
+    }
+    if system_instruction:
+        config_kwargs["system_instruction"] = system_instruction
+
     try:
-        value = st.secrets.get("GROQ_API_KEY")
-        if value:
-            return value
+        config = _genai_types.GenerateContentConfig(**config_kwargs)
+    except Exception:
+        # Fallback : dict simple si types pas dispo / signature changee
+        config = config_kwargs
+
+    # Cas trivial : 1 seul user message -> on peut passer directement le texte
+    if len(contents) == 1 and contents[0]["role"] == "user":
+        prompt_text = contents[0]["parts"][0]["text"]
+        resp = client.models.generate_content(
+            model=model,
+            contents=prompt_text,
+            config=config,
+        )
+    else:
+        resp = client.models.generate_content(
+            model=model,
+            contents=contents,
+            config=config,
+        )
+
+    # Extraction robuste du texte (resp.text peut etre vide / lever si bloque)
+    text = ""
+    try:
+        text = resp.text or ""
+    except Exception:
+        try:
+            text = "".join(
+                getattr(p, "text", "") or ""
+                for p in resp.candidates[0].content.parts
+            )
+        except Exception:
+            text = ""
+
+    return _wrap_llm_response(text)
+
+
+def _llm_chat_with_failover(messages, model=None, max_tokens=500,
+                            temperature=0.4, **kwargs):
+    """Appel chat completion avec basculement automatique entre providers/cles.
+
+    Ordre tente : Google Gemini (cles 1 & 2) puis Groq llama (cles 1 & 2).
+    Sur rate limit (429 / quota / resource_exhausted), marque la cle epuisee
+    pendant 60s et passe a la suivante. Sur erreur non-rate-limit (auth, model
+    inconnu, etc.), passe quand meme a la suivante mais memorise l'erreur pour
+    diagnostic (un provider invalide ne doit pas bloquer les autres).
+
+    Note : l'argument `model` est ignore (chaque entree _LLM_PROVIDERS a son
+    propre modele par defaut). Garde pour retro-compat avec les call sites.
+
+    Returns: objet OpenAI-compatible avec response.choices[0].message.content.
+    Raises: RuntimeError si aucun provider n'est configure ou si tous echouent.
+    """
+    available = _get_available_llm_providers()
+    if not available:
+        raise RuntimeError(
+            "Aucune cle API LLM configuree (GOOGLE_API_KEY, GOOGLE_API_KEY_1, "
+            "GROQ_API_KEY ou GROQ_API_KEY_1)"
+        )
+
+    last_error = None
+    tried = 0
+    for provider, secret_name, default_model, api_key in available:
+        if not _is_key_available(secret_name):
+            continue
+        tried += 1
+        try:
+            if provider == "google":
+                return _call_gemini_provider(
+                    api_key, default_model, messages,
+                    max_tokens, temperature, **kwargs,
+                )
+            else:  # groq
+                return _call_groq_provider(
+                    api_key, default_model, messages,
+                    max_tokens, temperature, **kwargs,
+                )
+        except Exception as exc:
+            last_error = exc
+            if _is_rate_limit_error(exc):
+                _mark_key_exhausted(secret_name, cooldown_seconds=60)
+            else:
+                # Erreur non-rate-limit : cooldown plus court (5s) pour eviter
+                # de marteler une cle cassee, mais sans bloquer trop longtemps
+                # au cas ou ce serait transitoire (network).
+                _mark_key_exhausted(secret_name, cooldown_seconds=5)
+            continue  # essaie le prochain provider/cle
+
+    if last_error:
+        raise last_error
+    raise RuntimeError(
+        "Toutes les cles API LLM sont actuellement en cooldown. "
+        "Reessaye dans ~1 minute."
+    )
+
+
+# Alias retro-compat : ancien nom utilise par les call sites existants
+_groq_chat_with_failover = _llm_chat_with_failover
+
+
+# ─── Couche de validation LLM (qualite thematique) ────────────────────────────
+# Apres l'assignation par keywords, le LLM scan les titres et juge si chaque
+# article est REELLEMENT lie au theme assigne. Permet de retirer le bruit
+# residuel (articles qui matchent les keywords mais sont off-topic en realite).
+# Appel batch par theme (jusqu'a 25 titres par requete). Cache via @st.cache_data
+# de data_media_scout (slot-based), donc ne s'execute que 2x/jour.
+
+_LLM_VALIDATE_CHUNK_SIZE = 25  # nb max d'articles par batch LLM (token budget)
+
+
+def _llm_validate_chunk(items: list, theme_label: str) -> set:
+    """Envoie un batch d'articles au LLM pour validation thematique.
+
+    Args:
+        items: liste de (df_index, title)
+        theme_label: nom du theme cible (FR, ex: "Agrumes, Fruits rouges & Maraichage")
+
+    Returns:
+        Set des df_index juges pertinents par le LLM. Sur erreur LLM (rate limit
+        total, JSON malformed), garde tous les indices (fallback safe -> evite
+        de perdre des donnees).
+    """
+    if not items:
+        return set()
+
+    titles_listed = "\n".join(
+        f"[{i}] {title}" for i, (_, title) in enumerate(items)
+    )
+    prompt = (
+        "Tu es expert en classification editoriale pour LES DOMAINES AGRICOLES, "
+        "groupe agro-industriel marocain.\n\n"
+        f"Theme cible : « {theme_label} »\n\n"
+        "Tu vas evaluer une liste d'articles (titres). Pour chacun, juge si le titre "
+        "est PERTINENT pour ce theme (le sujet principal OU un sujet majeur de l'article).\n\n"
+        "Sois INCLUSIF et raisonnable :\n"
+        "  - GARDE les articles dont le titre evoque le theme, meme indirectement\n"
+        "  - GARDE les articles generiques sur l'agriculture si le theme est T1 Agrumes/FR/Maraichage\n"
+        "  - GARDE les articles generiques sur l'elevage si le theme est T2 Elevage (sauf hors-scope explicite)\n"
+        "  - GARDE les articles sur food industry / distribution si le theme est T3 Produits laitiers/Epicerie\n"
+        "  - GARDE les articles climat / eau / energie sous tout angle pour T4\n"
+        "  - GARDE les articles sur normes / RSE / gouvernance / SST / certifications pour T5\n\n"
+        "REJETTE uniquement les cas FLAGRANTS :\n"
+        "  - Article sans aucun rapport identifiable avec le theme\n"
+        "  - Article sur un sujet completement different (ex: politique pure dans T1 agricole)\n\n"
+        "Articles a evaluer (numerotes [0]..[N-1]) :\n"
+        f"{titles_listed}\n\n"
+        "Reponds UNIQUEMENT en JSON strict, sans markdown ni explication :\n"
+        '{"relevant":[<indices entiers des articles a garder>]}'
+    )
+
+    try:
+        response = _groq_chat_with_failover(
+            messages=[{"role": "user", "content": prompt}],
+            model="llama-3.3-70b-versatile",
+            max_tokens=400,
+            temperature=0.1,
+        )
+        raw = response.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+        m = re.search(r"\{[\s\S]*\}", raw)
+        if m:
+            raw = m.group(0)
+        data = json.loads(raw)
+        relevant_ids = data.get("relevant", [])
+
+        # Mappe les indices locaux [0..N-1] vers les df_index
+        valid = set()
+        for i in relevant_ids:
+            try:
+                i = int(i)
+                if 0 <= i < len(items):
+                    valid.add(items[i][0])
+            except (TypeError, ValueError):
+                continue
+        return valid
+
+    except Exception:
+        # Fallback safe : garder TOUS les articles (ne pas perdre de donnees)
+        return {df_idx for df_idx, _ in items}
+
+
+def _llm_validate_themes(df):
+    """Pour chaque article du df, demande au LLM si son titre est strictement lie
+    au theme assigne. Drop les articles juges off-topic.
+
+    Cette fonction est appelee dans data_media_scout (cache 12h via slot).
+    Avec failover multi-cles, supporte ~5-10 batches par session sans atteindre
+    le rate limit de la free tier.
+    """
+    if not _has_any_llm_key() or df.empty:
+        return df
+
+    keep_mask = pd.Series(True, index=df.index)
+
+    for theme in MEDIA_SCOUT_THEMES:
+        theme_rows = df[df["Theme"] == theme]
+        if theme_rows.empty:
+            continue
+
+        # Build items : list of (df_idx, title)
+        items = [
+            (idx, str(row["Title"])[:200])
+            for idx, row in theme_rows.iterrows()
+        ]
+
+        # Process par chunks (token budget LLM)
+        for chunk_start in range(0, len(items), _LLM_VALIDATE_CHUNK_SIZE):
+            chunk = items[chunk_start:chunk_start + _LLM_VALIDATE_CHUNK_SIZE]
+            valid_df_indices = _llm_validate_chunk(chunk, theme)
+            # Drop les indices qui ne sont PAS dans valid
+            for df_idx, _ in chunk:
+                if df_idx not in valid_df_indices:
+                    keep_mask[df_idx] = False
+
+    return df[keep_mask]
+
+
+# ─── Application des outputs LLM en francais ────────────────────────────────
+# Marqueurs DISTINCTIFS francais (pas de faux-amis avec l'anglais)
+# Note : on evite les suffixes generiques (-tion, -ment, -es) qui matchent
+# aussi des mots anglais (regulation, government, laboratories...).
+_FR_STRONG_TOKENS = (
+    # Articles et determinants
+    " le ", " la ", " les ", " un ", " une ", " du ", " des ", " de ",
+    " au ", " aux ", " ce ", " cet ", " cette ", " ces ",
+    # Pronoms et conjonctions
+    " et ", " ou ", " ni ", " mais ", " donc ", " car ", " puis ",
+    " qui ", " que ", " quoi ", " dont ", " ou ",
+    # Prepositions distinctives
+    " avec ", " pour ", " dans ", " sur ", " par ", " sans ", " sous ",
+    " entre ", " vers ", " chez ", " contre ", " parmi ",
+    # Verbes etre/avoir/faire conjugues
+    " est ", " sont ", " etait ", " etaient ", " sera ", " seront ",
+    " a ete ", " ont ete ", " etre ", " ete ",
+    " ainsi ", " selon ", " aussi ", " encore ", " toujours ", " deja ",
+    " plus ", " moins ", " tres ", " trop ",
+    # Negation
+    " ne ", " pas ", " plus ", " jamais ", " rien ", " aucun ",
+    # Possessifs/demonstratifs
+    " son ", " sa ", " ses ", " leur ", " leurs ", " notre ", " votre ",
+    # Elisions (signature francaise tres forte)
+    " l'", " d'", " s'", " c'", " j'", " m'", " t'", " n'", " qu'",
+)
+
+_EN_STRONG_TOKENS = (
+    " the ", " of ", " and ", " is ", " are ", " was ", " were ",
+    " with ", " for ", " on ", " by ", " to ", " this ", " that ",
+    " these ", " those ", " has ", " have ", " had ", " will ",
+    " would ", " could ", " should ", " between ", " through ",
+    " during ", " however ", " regarding ", " whereas ", " among ",
+    " their ", " they ", " them ", " which ", " from ", " into ",
+    " upon ", " about ", " over ", " under ", " above ", " below ",
+    " when ", " where ", " while ", " because ", " although ",
+    " an ", " any ", " all ", " new ", " more ", " less ",
+)
+
+
+def _looks_french(text: str) -> bool:
+    """Detecte si le texte est predominantely en francais.
+
+    Heuristique : compare le nombre de tokens FR vs EN distinctifs +
+    presence de diacritics francais (é/è/ê/à/ç/...). Texte court (<35 chars)
+    -> True par defaut (titre).
+    """
+    if not text or len(text.strip()) < 35:
+        return True
+    raw = text.lower()
+    # Bonus important si presence de diacritics francais (signature claire FR)
+    has_diacritics = any(c in raw for c in "éèêëàâäîïôöùûüÿœæç")
+    padded = " " + raw + " "
+    fr = sum(1 for m in _FR_STRONG_TOKENS if m in padded)
+    en = sum(1 for m in _EN_STRONG_TOKENS if m in padded)
+    if has_diacritics:
+        fr += 4
+    return fr >= en
+
+
+def _force_french_translate(text: str, kind: str = "phrase") -> str:
+    """Traduit un texte en francais via LLM. Retourne l'original si echec.
+
+    Args:
+        text: texte a traduire (sera fallback inchange si echec ou deja FR)
+        kind: 'titre' (court) ou 'phrase' (libre) ou 'puce' (puce factuelle)
+    """
+    if not text or not text.strip():
+        return text
+    if _looks_french(text):
+        return text
+    # Prompt minimal pour traduction rapide
+    if kind == "titre":
+        instruction = (
+            "Traduis ce TITRE en francais correct, 10-14 mots maximum. "
+            "Reponds UNIQUEMENT par le titre francais, rien d'autre."
+        )
+    elif kind == "puce":
+        instruction = (
+            "Traduis cette PUCE de veille en francais correct. "
+            "Garde le prefixe (MA :, EU :, WW :) si present. "
+            "Maximum 28 mots. Reponds UNIQUEMENT par la puce traduite, rien d'autre."
+        )
+    else:
+        instruction = (
+            "Traduis ce texte en francais correct, fluide, style journalistique. "
+            "Garde la longueur similaire. Reponds UNIQUEMENT par la traduction, "
+            "sans introduction ni guillemets."
+        )
+    try:
+        resp = _llm_chat_with_failover(
+            messages=[
+                {"role": "system", "content": "Tu es un traducteur professionnel anglais->francais. Tu rends UNIQUEMENT du francais correct, jamais d'anglais."},
+                {"role": "user", "content": f"{instruction}\n\nTexte:\n{text[:1500]}"},
+            ],
+            max_tokens=400,
+            temperature=0.2,
+        )
+        translated = (resp.choices[0].message.content or "").strip()
+        # Nettoie les guillemets d'enrobage parfois ajoutes par le LLM
+        translated = translated.strip('"\'').strip()
+        # Verifie que la traduction est plausible et bien en FR
+        if translated and _looks_french(translated):
+            return translated
     except Exception:
         pass
-    return os.getenv("GROQ_API_KEY")
+    return text
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def summarize_scout_themes(theme_articles: dict) -> dict:
-    """Genere une synthese KPI-first par thematique a partir du contenu article disponible.
+def compute_signal_du_jour(articles_context: tuple) -> dict:
+    """Identifie le 'Signal du jour' : l'article le plus critique a mettre en alerte forte.
 
     Args:
-        theme_articles: {theme: tuple of article context strings}
+        articles_context: tuple de chaines decrivant les articles
+            (Titre|Source|Date|Theme|Veille|Resume|Lien)
 
     Returns:
-        {theme: summary string}
+        {
+          'eyebrow': str (ex: "Reglementaire · UE"),
+          'headline': str,
+          'body': str,
+          'source_url': str (URL de l'article retenu, validee),
+          'available': bool
+        }
     """
-    api_key = _get_groq_api_key()
-    if not api_key:
-        return {}
+    if not articles_context:
+        return {"available": False}
 
-    client = Groq(api_key=api_key)
-    summaries = {}
+    # Verifie qu'au moins UNE cle LLM (Google ou Groq) est configuree
+    if not _has_any_llm_key():
+        return {"available": False}
 
-    for theme, articles in theme_articles.items():
-        if not articles:
-            continue
-        articles_text = "\n".join(f"- {article}" for article in articles)
-        prompt = (
-            f"Voici {len(articles)} articles recents sur la thematique \"{theme}\". "
-            "Chaque entree contient le titre, la source, la date et le resume/description disponible :\n"
-            f"{articles_text}\n\n"
-            "Produis une synthese en francais sous forme de 2 a 3 bullet points courts, centres sur les points "
-            "importants ou signaux recurrents qui ressortent du contenu global des articles, et non sur un seul titre isole. "
-            "Priorise les KPIs, chiffres, dates, acteurs concernes, evolutions, tendances mesurables ou signaux operationnels "
-            "lorsqu'ils existent, mais ne cree pas de bullet point sur le volume d'articles analyses. "
-            "Si aucun chiffre explicite n'est disponible, formule les points comme des indicateurs qualitatifs observables, "
-            "sans inventer de donnees. "
-            "Format obligatoire: chaque ligne commence par '- '. Pas d'introduction, pas de conclusion."
-        )
+    # Liste blanche des URLs autorisees (anti-hallucination)
+    allowed_urls = set()
+    for entry in articles_context:
+        m = re.search(r"Lien:\s*(https?://\S+)", entry)
+        if m:
+            allowed_urls.add(m.group(1).strip())
+
+    articles_text = "\n".join(f"- {a}" for a in articles_context[:25])
+
+    prompt = (
+        "[LANGUE DE SORTIE = FRANCAIS UNIQUEMENT — instruction non-negociable] "
+        "Tous les champs (eyebrow, headline, body) DOIVENT etre rediges en francais correct, "
+        "MEME si l'article source est en anglais. Dans ce cas, traduis ET reformule en francais. "
+        "Aucun mot anglais autorise dans la sortie sauf les acronymes etablis (UE, ISO, RSE, GHG, "
+        "CSRD, BRC, etc.). JAMAIS de phrase en anglais.\n\n"
+        "Tu es analyste de veille pour LES DOMAINES AGRICOLES (LDA), groupe agro-industriel "
+        "marocain integrant : agrumes, fruits rouges, maraichage, elevage (ovin/bovin/caprin/"
+        "volaille), produits laitiers, epicerie fine, exports UE/Afrique/Moyen-Orient. "
+        "Standards QSE : GlobalGAP, IFS, BRC, FSSC 22000, ISO 14001/22000/26000/45001, Codex, "
+        "ONSSA, Halal/Bio.\n\n"
+        "Articles captures :\n\n"
+        f"{articles_text}\n\n"
+        "INSTRUCTION OBLIGATOIRE : tu DOIS choisir UN article parmi ceux fournis ci-dessus "
+        "(jamais retourner vide). Choisis L'ARTICLE LE PLUS PERTINENT pour LDA.\n\n"
+        "Criteres de selection (en ordre de priorite) :\n"
+        "  1. Decision reglementaire / normative impactant exports ou production\n"
+        "  2. Crise sanitaire / epizootie / retrait produit / alerte hydrique-climat\n"
+        "  3. Accord commercial export, mouvement concurrentiel marque, audit QSE\n"
+        "  4. Innovation technologique pertinente pour la filiere agro\n"
+        "  5. A defaut, l'article LE PLUS RECENT du corpus\n\n"
+        "Le BODY (3 a 4 phrases, 55-75 mots, EN FRANCAIS) :\n"
+        "  - Decris d'abord ce qui se passe (acteur / decision / chiffre cle / date)\n"
+        "  - Explique EXPLICITEMENT le mecanisme d'impact sur LDA (production vegetale, "
+        "elevage, transformation, exports, supply chain, conformite QSE)\n"
+        "  - Ne JAMAIS terminer par 'Impact sur LDA :' ou 'Impact :'. L'impact doit etre tisse "
+        "naturellement dans le texte\n"
+        "  - Pas de bullet points, pas de markdown, style journalistique fluide\n\n"
+        "RAPPEL FINAL : tous les champs de sortie EN FRANCAIS, sans exception.\n\n"
+        "Reponds en JSON STRICT (rien d'autre, pas de markdown). Tous les champs OBLIGATOIRES, "
+        "AUCUN ne doit etre vide :\n"
+        '{"eyebrow":"<Veille · Zone, EN FRANCAIS>",'
+        '"headline":"<titre 10-14 mots EN FRANCAIS, oriente impact>",'
+        '"body":"<3 a 4 phrases EN FRANCAIS, texte continu fluide, 55-75 mots>",'
+        '"source_url":"<URL EXACTE choisie dans la liste fournie>"}'
+    )
+    # Fallback : prend le 1er article du corpus et tente une traduction LLM en francais
+    def _parse_article_fields(article_str: str) -> dict:
+        fields = {}
+        for part in article_str.split(" | "):
+            if ":" in part:
+                key, val = part.split(":", 1)
+                fields[key.strip().lower()] = val.strip()
+        return fields
+
+    def _translate_to_french(headline_raw: str, summary_raw: str) -> tuple:
+        """Tente une traduction LLM courte vers le francais.
+        Si echec, retourne (headline_raw, summary_raw) inchanges.
+        """
+        if not headline_raw and not summary_raw:
+            return ("", "")
         try:
-            response = client.chat.completions.create(
+            trans_prompt = (
+                "Traduis le titre et le resume ci-dessous EN FRANCAIS CORRECT. "
+                "Si deja en francais, reformule legerement pour lisibilite. "
+                "Reponds en JSON strict : "
+                '{"titre_fr":"<titre francais court 10-14 mots>",'
+                '"resume_fr":"<resume francais 2-3 phrases, 40-60 mots>"}\n\n'
+                f"Titre: {headline_raw[:280]}\n"
+                f"Resume: {summary_raw[:600]}"
+            )
+            resp = _groq_chat_with_failover(
+                messages=[
+                    {"role": "system", "content": "Tu es un traducteur professionnel anglais->francais. Tu rends UNIQUEMENT du francais correct, sans anglais."},
+                    {"role": "user", "content": trans_prompt},
+                ],
                 model="llama-3.3-70b-versatile",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=180,
+                max_tokens=300,
                 temperature=0.3,
             )
-            summaries[theme] = response.choices[0].message.content.strip()
+            txt = resp.choices[0].message.content.strip()
+            if txt.startswith("```"):
+                txt = re.sub(r"^```(?:json)?\s*", "", txt)
+                txt = re.sub(r"\s*```$", "", txt)
+            mm = re.search(r"\{[\s\S]*\}", txt)
+            if mm:
+                txt = mm.group(0)
+            data = json.loads(txt)
+            return (
+                str(data.get("titre_fr", "")).strip() or headline_raw,
+                str(data.get("resume_fr", "")).strip() or summary_raw,
+            )
         except Exception:
-            summaries[theme] = ""
+            return (headline_raw, summary_raw)
 
-    return summaries
+    def _build_fallback_signal():
+        if not articles_context:
+            return {"available": False}
+        first = articles_context[0]
+        fields = _parse_article_fields(first)
+        headline_raw = fields.get("titre", "")
+        resume_raw = fields.get("resume", "")
+        source = fields.get("source", "")
+        theme = fields.get("theme", "")
+        veille_short = fields.get("veille", "Informative").replace("Veille ", "")
+
+        # Traduction defensive vers le francais (cas article EN)
+        headline_fr, resume_fr = _translate_to_french(headline_raw, resume_raw)
+        headline_fr = headline_fr[:160] if headline_fr else f"Signal issu de {source}"
+
+        # Body en francais : resume traduit OU phrase generique francaise
+        if resume_fr:
+            words = resume_fr.split()
+            body = " ".join(words[:70]) + ("..." if len(words) > 70 else "")
+        else:
+            body = (
+                f"Article identifie via {source} sur le perimetre {theme}. "
+                "Sujet a surveiller pour ses implications potentielles sur les activites "
+                "du groupe (production, transformation, exports ou conformite)."
+            )
+
+        return {
+            "eyebrow": f"{veille_short} · {theme}" if theme else veille_short,
+            "headline": headline_fr,
+            "body": body,
+            "source_url": fields.get("lien", ""),
+            "available": bool(headline_fr),
+        }
+
+    try:
+        response = _groq_chat_with_failover(
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Tu es analyste de veille pour LES DOMAINES AGRICOLES. "
+                        "REGLE ABSOLUE : tous tes outputs DOIVENT etre en francais "
+                        "correct, JAMAIS en anglais ni dans une autre langue. "
+                        "Meme si les articles sources sont en anglais, tu TRADUIS et "
+                        "REFORMULES en francais. Acronymes anglais autorises (ISO, RSE, "
+                        "GHG, CSRD, BRC). Aucune phrase complete en anglais."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            model="llama-3.3-70b-versatile",
+            max_tokens=500,
+            temperature=0.4,
+        )
+        raw = response.choices[0].message.content.strip()
+        # Strip markdown code fences if present
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+        # Extract JSON object even if wrapped in extra prose
+        m = re.search(r"\{[\s\S]*\}", raw)
+        if m:
+            raw = m.group(0)
+        parsed = json.loads(raw)
+        headline = str(parsed.get("headline", "")).strip()
+        body = str(parsed.get("body", "")).strip()
+        eyebrow = str(parsed.get("eyebrow", "")).strip()
+        # Si le LLM a retourne JSON valide mais headline/body vides -> fallback
+        if not headline or not body:
+            return _build_fallback_signal()
+        # GARDE-FOU LANGUE : verifie chaque champ + retraduit si pas en francais
+        if not _looks_french(headline):
+            headline = _force_french_translate(headline, kind="titre")
+        if not _looks_french(body):
+            body = _force_french_translate(body, kind="phrase")
+        if eyebrow and not _looks_french(eyebrow):
+            eyebrow = _force_french_translate(eyebrow, kind="titre")
+        url = str(parsed.get("source_url", "")).strip()
+        # Validation : l'URL doit etre dans la liste passee (anti-hallucination)
+        if url and url not in allowed_urls:
+            url = ""
+        return {
+            "eyebrow": eyebrow,
+            "headline": headline,
+            "body": body,
+            "source_url": url,
+            "available": True,
+        }
+    except Exception:
+        # En cas d'erreur LLM (timeout, JSON parse, network, etc.) : fallback heuristique
+        return _build_fallback_signal()
+
+
+# Mapping pour normaliser les prefixes de puces vers MA / EU / WW
+_BULLET_PREFIX_MAP = {
+    # MA - Maroc / Maghreb / Afrique du Nord
+    "maroc": "MA", "morocco": "MA", "marocain": "MA", "marocaine": "MA",
+    "maghreb": "MA", "afrique du nord": "MA", "north africa": "MA", "ma": "MA",
+    "onssa": "MA", "imanor": "MA", "ministere": "MA", "agrimaroc": "MA",
+    # EU - Europe / pays europeens / institutions UE
+    "ue": "EU", "eu": "EU", "europe": "EU", "europeen": "EU", "european": "EU",
+    "union europeenne": "EU", "commission europeenne": "EU", "commission": "EU",
+    "france": "EU", "francais": "EU", "francaise": "EU", "french": "EU",
+    "royaume-uni": "EU", "royaume uni": "EU", "uk": "EU", "british": "EU", "britannique": "EU",
+    "allemagne": "EU", "germany": "EU", "german": "EU",
+    "espagne": "EU", "spain": "EU", "spanish": "EU",
+    "italie": "EU", "italy": "EU", "italian": "EU",
+    "pays-bas": "EU", "netherlands": "EU", "dutch": "EU",
+    "belgique": "EU", "belgium": "EU",
+    "efsa": "EU", "efrag": "EU", "esma": "EU", "afnor": "EU", "novethic": "EU",
+    "dg sante": "EU", "eu-osha": "EU", "emas": "EU",
+    "ecovadis": "EU", "actu-environnement": "EU", "carenews": "EU",
+    # WW - International / Mondial / Onusien
+    "ww": "WW", "international": "WW", "mondial": "WW", "monde": "WW", "world": "WW",
+    "global": "WW", "globale": "WW", "non-profit": "WW",
+    "fao": "WW", "oms": "WW", "who": "WW", "oit": "WW", "ilo": "WW", "onu": "WW", "un": "WW",
+    "iso": "WW", "ocde": "WW", "oecd": "WW", "iea": "WW", "irena": "WW", "unep": "WW",
+    "usa": "WW", "etats-unis": "WW", "us": "WW", "americain": "WW", "american": "WW",
+    "fda": "WW", "usda": "WW", "osha us": "WW", "wri": "WW",
+    "codex": "WW", "woah": "WW", "oie": "WW", "globalgap": "WW", "global gap": "WW",
+    "poultry world": "WW", "dairyreporter": "WW",
+    "ifs": "WW", "brcgs": "WW", "brc": "WW", "fssc": "WW", "sedex": "WW", "smeta": "WW",
+    "fairtrade": "WW", "fsc": "WW", "gri": "WW", "ifrs": "WW", "sasb": "WW", "issb": "WW",
+    "tnfd": "WW", "sbti": "WW", "cdp": "WW", "ghg protocol": "WW", "ghgprotocol": "WW",
+    "pri": "WW", "responsible investor": "WW", "esg today": "WW", "esg investor": "WW",
+    "environmental finance": "WW", "climate home news": "WW", "carbon brief": "WW",
+    "ellen macarthur": "WW", "ellenmacarthur": "WW", "basel": "WW",
+    "energy voice": "WW", "just food": "WW", "food navigator": "WW",
+}
+
+
+def _normalize_bullet_prefix(bullet: str) -> str:
+    """Reecrit le prefixe d'une puce vers MA / EU / WW si necessaire.
+
+    Si la puce commence deja par 'MA :', 'EU :' ou 'WW :', la garde telle quelle.
+    Sinon, tente de remapper le prefixe (avant le premier ' : ') via _BULLET_PREFIX_MAP.
+    En dernier recours, garde la puce inchangee (fallback safe).
+    """
+    if not bullet:
+        return bullet
+    # Deja conforme : MA : / EU : / WW : (case insensitive en debut)
+    m = re.match(r"^\s*(MA|EU|WW)\s*:\s*(.+)", bullet, re.IGNORECASE)
+    if m:
+        return f"{m.group(1).upper()} : {m.group(2).strip()}"
+    # Cherche un prefixe au format "<libelle> : <reste>"
+    m = re.match(r"^\s*([^:]{1,40}?)\s*:\s*(.+)", bullet)
+    if not m:
+        return bullet
+    raw_prefix = m.group(1).strip().lower()
+    rest = m.group(2).strip()
+    # Lookup direct
+    if raw_prefix in _BULLET_PREFIX_MAP:
+        return f"{_BULLET_PREFIX_MAP[raw_prefix]} : {rest}"
+    # Lookup partiel : check si un keyword est contenu dans le prefixe
+    for key, zone in _BULLET_PREFIX_MAP.items():
+        if key in raw_prefix:
+            return f"{zone} : {rest}"
+    # Fallback : pas de match -> WW (international par defaut, neutre)
+    return f"WW : {rest}"
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def compute_veille_summary(articles_context: tuple, veille_label: str) -> dict:
+    """Synthese KPI/chiffres/idees globales pour un cadre Veille (Reg / Inf).
+
+    Format uniforme pour les 2 veilles :
+      - 5 a 7 puces (4-6 pour Informative, 5-7 pour Reglementaire)
+      - Max 26 mots par puce
+      - Style telegraphique factuel, chiffres en chiffres + unites courtes
+
+    Args:
+        articles_context: tuple de chaines (Titre|Source|Date|Theme|Resume)
+        veille_label: nom de la veille (ex: "Veille Reglementaire")
+
+    Returns:
+        {
+          'bullets': list[str]
+          'available': bool
+        }
+    """
+    if not articles_context:
+        return {"bullets": [], "available": False}
+
+    if not _has_any_llm_key():
+        return {"bullets": [], "available": False}
+
+    articles_text = "\n".join(f"- {a}" for a in articles_context[:30])
+
+    is_reg = "reglementaire" in veille_label.lower() or "réglementaire" in veille_label.lower()
+
+    # Angle d'analyse selon la veille (format de sortie identique - format harmonise)
+    if is_reg:
+        veille_focus = (
+            "Angle d'analyse : nouveautes REGLEMENTAIRES (textes officiels, normes, sanctions, "
+            "echeances de conformite, seuils techniques imposes)."
+        )
+    else:
+        veille_focus = (
+            "Angle d'analyse : tendances INFORMATIVES de fond (chiffres marche, evolutions filiere, "
+            "innovations, contexte geopolitique/climat impactant le secteur)."
+        )
+
+    n_articles = len(articles_context)
+    # Nombre de puces = nombre d'articles plafonne a 5 (1 article -> 1 puce, 3 -> 3 puces, 5+ -> 5)
+    target_bullets = min(n_articles, 5)
+
+    prompt = (
+        "Tu es analyste de veille pour LES DOMAINES AGRICOLES, groupe agro-industriel marocain : "
+        "production vegetale (agrumes, fruits rouges, maraichage), elevage ovin/bovin/caprin/volaille, "
+        "produits laitiers, epicerie fine, exports UE/Afrique/Moyen-Orient. "
+        "Standards QSE applicables : GlobalGAP, IFS Food, BRCGS, FSSC 22000, ISO 9001/14001/22000/26000/45001, "
+        "Codex Alimentarius, ONSSA, IMANOR, certifications Halal/Bio.\n\n"
+        "LANGUE DE SORTIE : OBLIGATOIREMENT FRANCAIS. "
+        "Toutes les puces doivent etre redigees en francais correct, meme si les articles fournis "
+        "sont en anglais (traduis et reformule en francais).\n\n"
+        f"Cadre a analyser : {veille_label}\n"
+        f"{veille_focus}\n\n"
+        f"Voici les {n_articles} article(s) effectivement captures sur la periode et le theme selectionne :\n\n"
+        f"{articles_text}\n\n"
+        "REGLE FONDAMENTALE - ANCRE STRICTE DANS LE CORPUS :\n"
+        "  - Chaque puce DOIT etre tiree EXCLUSIVEMENT du contenu des articles fournis ci-dessus.\n"
+        "  - INTERDIT d'inventer des chiffres, organismes, dates, evenements absents des articles.\n"
+        "  - INTERDIT d'ajouter des 'tendances generales sectorielles' qui ne sont pas dans le corpus.\n"
+        "  - Si un article ne mentionne pas de chiffre, ne fabrique PAS de chiffre : restitue le fait qualitatif.\n\n"
+        f"Genere EXACTEMENT {target_bullets} puce(s) (1 puce par article ou groupe d'articles thematiquement lie). "
+        f"Plafonne a 5 si plus de 5 articles, mais ne descend pas en dessous de {target_bullets}.\n\n"
+        "STRUCTURE OBLIGATOIRE de chaque puce (format strictement uniforme) :\n"
+        "  [PREFIXE] : [Fait factuel tire de l'article avec chiffre si present]. [Implication concise pour la filiere].\n\n"
+        "PREFIXES AUTORISES (UN SEUL de ces trois codes, EXACTEMENT, suivi de ' : ') :\n"
+        "  - « MA : » pour Maroc / Afrique du Nord / Maghreb / sources gouvernementales marocaines (ONSSA, IMANOR, ministeres, AgriMaroc, EcoActu, FNH, CGEM, Medias24, MAP, Le Vert...)\n"
+        "  - « EU : » pour Union Europeenne ET pays europeens (incluant Royaume-Uni, France, Allemagne, Espagne...) + institutions UE (Commission, EFSA, DG SANTE, EFRAG, ESMA, AFNOR, Novethic, Actu-Environnement...)\n"
+        "  - « WW : » pour international / mondial / ONU-FAO-OMS-OIT / ISO / normes mondiales / autres regions (USA, Asie, Afrique sub-saharienne, Moyen-Orient...)\n\n"
+        "REGLE STRICTE : utiliser UNIQUEMENT « MA : », « EU : » ou « WW : » comme prefixe. "
+        "JAMAIS d'autre format (« Royaume-Uni : », « France : », « Bio&Me : », « FeedNavigator : » INTERDITS).\n\n"
+        "Exemples du format attendu :\n"
+        "  - « EU : Reglement 2024/1234 impose un seuil residus pesticides a 0.01 mg/kg pour les agrumes des le 1er janvier 2026. Conformite requise pour exports. »\n"
+        "  - « EU : Bio&Me capitalise sur la tendance croissante de la sante intestinale et de la consommation de fibres. Signal de positionnement pour epicerie fine. »\n"
+        "  - « MA : ONSSA renforce les controles a l'import avec 12 nouveaux laboratoires accredites. Delais de dedouanement reduits a 48h. »\n"
+        "  - « WW : FAO note une hausse de 8 pct des prix mondiaux des produits laitiers en Q3 2024. Pression sur les marges aval. »\n\n"
+        "Regles formelles UNIFORMES :\n"
+        "  - Toujours commencer EXACTEMENT par « MA : », « EU : » ou « WW : »\n"
+        "  - 28 mots MAXIMUM par puce, 15 mots minimum\n"
+        "  - Chiffres en chiffres + unite courte (%, M$, MAD, EUR, t, MW, jours...) UNIQUEMENT si presents dans l'article\n"
+        "  - Pas de jargon journalistique ('selon', 'a indique', 'precise que')\n"
+        "  - Pas de titre d'article cite verbatim\n"
+        "  - Pas de double-quote DANS les puces\n"
+        "  - Chaque puce porte sur un sujet distinct (zero doublon)\n\n"
+        f"Reponds STRICTEMENT au format JSON (rien d'autre, pas de markdown). Le tableau bullets contient {target_bullets} element(s) :\n"
+        '{"bullets":["<puce>", ...]}'
+    )
+    try:
+        response = _groq_chat_with_failover(
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Tu es analyste de veille pour LES DOMAINES AGRICOLES. "
+                        "REGLE ABSOLUE : toutes les puces produites DOIVENT etre en "
+                        "francais correct, JAMAIS en anglais ni dans une autre langue. "
+                        "Meme si les articles sources sont en anglais, tu TRADUIS et "
+                        "REFORMULES en francais. Acronymes anglais autorises (ISO, RSE, "
+                        "GHG, CSRD, BRC). Aucune phrase complete en anglais."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            model="llama-3.3-70b-versatile",
+            max_tokens=600,
+            temperature=0.25,
+        )
+        raw = response.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+        m = re.search(r"\{[\s\S]*\}", raw)
+        if m:
+            raw = m.group(0)
+        parsed = json.loads(raw)
+        bullets = parsed.get("bullets", [])
+        # Nettoyage : strings non vides, cap au nombre d'articles disponibles (max 5)
+        # Permet 1 article -> 1 puce, 3 articles -> 3 puces, 5+ articles -> 5 puces
+        bullets = [str(b).strip() for b in bullets if str(b).strip()][:target_bullets]
+        # Normalisation des prefixes : remplace les prefixes non-conformes par MA/EU/WW
+        bullets = [_normalize_bullet_prefix(b) for b in bullets]
+        # GARDE-FOU LANGUE : chaque puce doit etre en francais (sinon retraduction)
+        bullets = [
+            b if _looks_french(b) else _force_french_translate(b, kind="puce")
+            for b in bullets
+        ]
+        # Re-normalise les prefixes apres traduction (au cas ou)
+        bullets = [_normalize_bullet_prefix(b) for b in bullets]
+        return {"bullets": bullets, "available": bool(bullets)}
+    except Exception:
+        return {"bullets": [], "available": False}

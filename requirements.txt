@@ -1,8 +1,8 @@
 beautifulsoup4==4.14.3
+google-genai==2.6.0
 groq==1.2.0
+openpyxl
 pandas==2.3.3
-PyYAML==6.0.3
 requests==2.33.1
 streamlit==1.53.1
-streamlit-authenticator==0.2.2
-streamlit-lottie==0.0.3
+tzdata
