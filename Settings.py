@@ -115,6 +115,17 @@ MEDIA_SCOUT_SOURCE_CATALOG = [
     # NB: Codex (404) et GlobalG.A.P. (404) retires -> repris via Google News RSS normes.
     {"Journal": "FAO Newsroom", "URL": "https://www.fao.org/newsroom/en", "Couverture": "Agriculture, alimentation, securite alimentaire"},
 
+    # ─── PRODUITS FRAIS / FILIERE FRUITS & LEGUMES (T1 selon contenu) ──────────
+    # Presse specialisee fruits & legumes frais (export, marche, varietes). NON
+    # forcees sur un theme : le scoring keywords + validation LLM ne gardent que
+    # les articles lies aux cultures LDA (agrumes, fruits rouges, maraichage),
+    # ce qui evite le bruit (bananes/avocats que LDA ne produit pas). Les sources
+    # EN (FruitNet, FreshFruitPortal) sont auto-traduites en FR a l'affichage.
+    {"Journal": "FreshPlaza FR",     "URL": "https://news.google.com/rss/search?q=site:freshplaza.fr&hl=fr&gl=MA&ceid=MA:fr", "Couverture": "Fruits & legumes frais — marche, export (FreshPlaza, via GNews)"},
+    {"Journal": "Agro-media",        "URL": "https://www.agro-media.fr/feed/",        "Couverture": "Agroalimentaire France — filieres, industrie, innovation"},
+    {"Journal": "FreshFruitPortal",  "URL": "https://www.freshfruitportal.com/feed/", "Couverture": "Fruits frais mondial — marche, export, varietes"},
+    {"Journal": "FruitNet",          "URL": "https://www.fruitnet.com/45.rss",        "Couverture": "Filiere fruits & legumes (international, trade)"},
+
     # ─── CONCURRENTS LDA — Sites corporates (HTML pages presse) ────────────────
     # Note: la majorite des sites corporates sont des SPA JS non scrapables
     # (Groupe Bel, Ribambel, Nestlé MENA, Aïcha retires) — leurs marques sont
@@ -769,13 +780,12 @@ MEDIA_SCOUT_SOURCE_ORIGINS = {
     "Challenge.ma": "Maroc",
 
     # France (couvertures UE / globales uniquement)
-    "Actu-Environnement": "France",
-    "Novethic": "France",
     "AFNOR Actualites": "France",
-    "EcoVadis": "France",
-    "Groupe Bel": "France",
-    "Ribambel (Bel)": "France",
-    "Nestlé MENA": "International",
+    # Presse fruits & legumes / agroalimentaire
+    "FreshPlaza FR": "France",
+    "Agro-media": "France",
+    "FruitNet": "Royaume-Uni",
+    "FreshFruitPortal": "International",
     # Google News RSS (multi-source aggregators) -> zone "International"
     "GNews — Centrale Danone": "International",
     "GNews — COPAG Jaouda": "International",
@@ -899,14 +909,12 @@ MEDIA_SCOUT_SOURCE_ZONES = {
     # EU (couvertures globales / directives impactant Maroc)
     "EFSA":                                   "EU",
     "DG SANTE EU - Food":                     "EU",
-    "Actu-Environnement":                     "EU",
-    "Novethic":                               "EU",
     "AFNOR Actualites":                       "EU",
-    # Concurrents LDA EU (laitier + epicerie) - corporates parents
-    "Groupe Bel":                             "EU",
-    "Ribambel (Bel)":                         "EU",
-    "Nestlé MENA":                            "WORLD",
-    # Google News RSS aggregators (multi-source)
+    # Presse fruits & legumes / agroalimentaire
+    "FreshPlaza FR":                          "EU",
+    "Agro-media":                             "EU",
+    "FruitNet":                               "EU",
+    "FreshFruitPortal":                       "WORLD",
     # Google News RSS aggregators (multi-source) -> tagged WORLD
     "GNews — Centrale Danone":                "WORLD",
     "GNews — COPAG Jaouda":                   "WORLD",
@@ -1212,12 +1220,26 @@ def _date_from_url(link):
     return ""
 
 
+# Titres "poubelle" : elements de navigation/UI captes par erreur par le scraper
+# (ex: DG SANTE expose un bouton "Filter by"). Rejetes au niveau _article_record.
+_JUNK_TITLES = frozenset({
+    "filter by", "filter", "filters", "read more", "lire la suite", "load more",
+    "voir plus", "see all", "voir tout", "show more", "all news", "toutes les actualites",
+    "subscribe", "newsletter", "search", "rechercher", "menu", "share", "partager",
+    "next", "previous", "suivant", "precedent", "read article", "en savoir plus",
+    "more", "view all", "accueil", "home", "back", "retour",
+})
+
+
 def _article_record(source_url, title, description, link, date_value):
     title = _clean_media_text(title)
     description = _clean_media_text(description)
     link = urljoin(source_url, _clean_media_text(link))
     date_text = _normalize_media_date(date_value) or _date_from_url(link)
     if not title or len(title) < 8 or not link or not date_text:
+        return None
+    # Rejette les titres de navigation/UI (ex: "Filter by", "Read more"...)
+    if _fold_media_text(title).strip() in _JUNK_TITLES:
         return None
     return {
         "Date": date_text,
@@ -2015,7 +2037,7 @@ except Exception:
 # Bumper cette version a chaque modification de la taxonomie (themes, keywords, sources).
 # Inclus dans le slot de cache -> invalide automatiquement le DataFrame en cache et
 # force un re-scraping a la prochaine execution.
-_TAXONOMY_VERSION = "v23"
+_TAXONOMY_VERSION = "v25"
 
 
 def current_cache_slot() -> str:

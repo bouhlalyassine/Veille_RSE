@@ -45,7 +45,7 @@ load_css()
 # ─── Pre-warm cache (scraping global au demarrage, cache 10h) ─────────────────
 # data_media_scout est l'unique source : decoree @st.cache_data(ttl=36000),
 # on l'appelle ici pour peupler le cache au demarrage. Tous les appels suivants
-# (dans le bloc Activate Agent) hit le cache en quelques millisecondes.
+# (rendu du tableau de bord Veille) hit le cache en quelques millisecondes.
 with st.spinner("Recherche d'actualités en cours sur l'ensemble des sources (première ouverture du jour : quelques minutes)..."):
     _slot = current_cache_slot()
     data_media_scout(MEDIA_SCOUT_URLS, slot=_slot)
@@ -104,12 +104,28 @@ def _veille_display(veille: str) -> str:
 
 def _theme_display(theme: str) -> str:
     return {
-        "Agrumes, Fruits rouges & Maraichage":           "Agrumes, Fruits rouges & Maraîchage",
-        "Elevage (Ovins, Bovins, Caprins, Volailles)":   "Élevage (Ovins, Bovins, Caprins, Volailles)",
-        "Produits laitiers & Epicerie fine":             "Produits laitiers & Épicerie fine",
-        "Environnement, Eau & Energie":                  "Environnement, Eau & Énergie",
-        "ESG, QSE & SST":                                "Normes : ESG, QSE & SST",
+        "Agrumes, Fruits rouges & Maraichage":           "🍊 Agrumes, Fruits rouges & Maraîchage",
+        "Elevage (Ovins, Bovins, Caprins, Volailles)":   "🐄 Élevage (Ovins, Bovins, Caprins, Volailles)",
+        "Produits laitiers & Epicerie fine":             "🧀 Produits laitiers & Épicerie fine",
+        "Environnement, Eau & Energie":                  "🌍 Environnement, Eau & Énergie",
+        "ESG, QSE & SST":                                "🏛️ Normes : ESG, QSE & SST",
     }.get(theme, theme)
+
+
+def _theme_plain(theme: str) -> str:
+    """Nom du theme SANS emoji (le filigrane decoratif fournit deja l'emoji)."""
+    emoji = MEDIA_SCOUT_THEME_EMOJI.get(theme, "")
+    return _theme_display(theme).replace(emoji, "").strip()
+
+
+# Couleur d'accent par thème -> dégradé de fond + emoji filigrane des boutons.
+_THEME_COLORS = {
+    "Agrumes, Fruits rouges & Maraichage":           "#E8833A",  # orange agrumes
+    "Elevage (Ovins, Bovins, Caprins, Volailles)":   "#9268C2",  # violet
+    "Produits laitiers & Epicerie fine":             "#C9A227",  # ambre/or
+    "Environnement, Eau & Energie":                  "#4FA268",  # vert
+    "ESG, QSE & SST":                                "#5C84C4",  # bleu normes
+}
 
 
 def _zone_label(source_name: str) -> str:
@@ -451,12 +467,37 @@ div[data-testid="stAppViewContainer"] main .block-container{
     background:var(--paper-2) !important;
 }
 
-/* Toggle "Activate Agent" : label plus contraste */
-[data-testid="stToggle"] label p,
-[data-testid="stToggle"] label div{
-    color:var(--ink) !important;
-    font-weight:600 !important;
+/* Bouton navigation À Propos / Veille DA — 2 etats bien distincts & visibles */
+/* Base commune (forme, taille) */
+.st-key-nav_apropos button,
+.st-key-nav_veille button{
+    border-radius:8px !important;
+    font-weight:800 !important;
+    min-height:40px !important;
+    white-space:nowrap !important;
+    box-shadow:0 4px 12px -8px rgba(74,64,48,.45) !important;
+    transition:filter .15s ease, background .15s ease, border-color .15s ease, transform .15s ease !important;
 }
+.st-key-nav_apropos button p,
+.st-key-nav_veille button p{ font-weight:800 !important; font-size:14px !important; }
+
+/* Les 2 etats (À Propos ET Veille DA) ont le MEME style : contour gold + fond
+   ambré clair au repos -> remplissage gold + texte crème au survol. */
+.st-key-nav_apropos button,
+.st-key-nav_veille button{
+    background:var(--paper-3) !important;
+    border:1.5px solid var(--gold-deep) !important;
+}
+.st-key-nav_apropos button p,
+.st-key-nav_veille button p{ color:var(--gold-deep) !important; }
+.st-key-nav_apropos button:hover,
+.st-key-nav_veille button:hover{
+    background:var(--gold-deep) !important;
+    border-color:var(--gold-deep) !important;
+    transform:translateY(-1px) !important;
+}
+.st-key-nav_apropos button:hover p,
+.st-key-nav_veille button:hover p{ color:var(--paper) !important; }
 .st-key-filter-row [data-baseweb="select"] {
     background:var(--paper) !important;
     border-color:var(--line) !important;
@@ -872,6 +913,35 @@ div[data-testid="stAppViewContainer"] main .block-container{
 .presentation-card li{ margin-bottom:6px !important; }
 .presentation-card b{ color:var(--ink); font-weight:600; }
 
+/* ────────── LANDING : boutons de thème (dégradé + emoji filigrane) ────────── */
+/* Base commune. Le dégradé de fond + l'emoji filigrane (::after) sont injectés
+   dynamiquement par thème (couleur dédiée) dans le bloc landing. */
+[class*="st-key-theme_btn_"] button{
+    position:relative !important;          /* ancre le filigrane ::after */
+    overflow:hidden !important;            /* clippe le filigrane */
+    border:1.5px solid var(--gold-deep) !important;
+    border-radius:16px !important;
+    min-height:155px !important;
+    padding:16px 18px !important;
+    display:flex !important; align-items:center !important; justify-content:center !important;
+    white-space:normal !important;
+    text-align:center !important;
+    box-shadow:0 6px 18px -14px rgba(74,64,48,.35) !important;
+    transition:transform .15s ease, box-shadow .15s ease, border-color .15s ease, background .25s ease !important;
+}
+[class*="st-key-theme_btn_"] button:hover{
+    transform:translateY(-4px) !important;
+    box-shadow:0 18px 34px -16px rgba(74,64,48,.55) !important;
+    border-color:var(--gold-deep) !important;
+}
+[class*="st-key-theme_btn_"] button p{
+    position:relative !important; z-index:1 !important;   /* texte au-dessus du filigrane */
+    font-family:"Inter" !important; font-weight:800 !important;
+    font-size:21px !important; line-height:1.4 !important;
+    color:var(--ink) !important;
+    text-shadow:0 1px 3px var(--paper) !important;        /* lisibilité sur le dégradé */
+}
+
 /* Sources section heading */
 .sources-heading{
     font-family:"Cinzel", serif !important; font-weight:700 !important; font-size:20px !important;
@@ -1207,6 +1277,22 @@ div[data-testid="stAppViewContainer"] main .block-container{
 /* MOBILE RESPONSIVE (tablet & phone, <=768px)                              */
 /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
 @media (max-width: 768px) {
+    /* Mobile : supprimer les espaces (br) entre la topbar et le contenu */
+    .st-key-landing-top-spacer,
+    .st-key-veille-top-spacer{ display:none !important; }
+
+    /* Collapse les conteneurs INVISIBLES (CSS injecté <style> + iframes JS height=0)
+       qui occupent quand même un "slot" flex avec gap -> espaces fantômes entre la
+       topbar et le contenu. display:none retire le slot ; les <style> restent actifs
+       (métadonnées non affectées par le display) et les iframes JS continuent de
+       s'exécuter (toujours présents dans le DOM). */
+    [data-testid="stElementContainer"]:has(style),
+    [data-testid="stElementContainer"]:has(iframe),
+    .element-container:has(style),
+    .element-container:has(iframe){
+        display:none !important;
+    }
+
     /* Main container : reduire padding lateral pour gagner de l espace */
     /* padding-top reduit car filterbar passe en flow sur mobile (position:relative) */
     .stApp .block-container,
@@ -1655,9 +1741,8 @@ def _show_veille_details(veille, group, selected_themes, calendar_events=None):
         theme_articles = group[group["Theme"] == theme]
         if theme_articles.empty:
             continue
-        theme_emoji = MEDIA_SCOUT_THEME_EMOJI.get(theme, "")
         st.markdown(
-            f'<div class="scout-theme-divider">{theme_emoji} {escape(_theme_display(theme))}</div>',
+            f'<div class="scout-theme-divider">{escape(_theme_display(theme))}</div>',
             unsafe_allow_html=True,
         )
         # Tri : Zone Maroc > EU > World, puis Date desc
@@ -1704,9 +1789,6 @@ def _show_events_dialog(events, themes, start_date):
     cards = []
     for evt in events:
         d = evt["date"]
-        theme = evt.get("theme", "")
-        theme_display = _theme_display(theme)
-        theme_emoji = MEDIA_SCOUT_THEME_EMOJI.get(theme, "")
         cat = evt.get("category", "")
         scope = evt.get("scope", "")
         scope_chip = "🇲🇦 Maroc" if scope == "Maroc" else "🌍 International"
@@ -2238,11 +2320,14 @@ def _render_veille_dashboard(filtered_df, selected_themes, upcoming_events, star
     )
 
 
-# ─── UI STATE (dark mode + filterbar freeze) ─────────────────────────────────
+# ─── UI STATE (dark mode + filterbar freeze + vue active) ────────────────────
 if "dark_mode" not in st.session_state:
     st.session_state["dark_mode"] = False
 if "filterbar_frozen" not in st.session_state:
     st.session_state["filterbar_frozen"] = True
+# Vue active : "veille" (tableau de bord, par defaut) ou "apropos" (page info agent)
+if "scout_view" not in st.session_state:
+    st.session_state["scout_view"] = "veille"
 
 
 def _toggle_dark_mode():
@@ -2251,6 +2336,19 @@ def _toggle_dark_mode():
 
 def _toggle_freeze():
     st.session_state["filterbar_frozen"] = not st.session_state.get("filterbar_frozen", True)
+
+
+def _toggle_view():
+    # Bascule entre le tableau de bord Veille et la page À Propos
+    cur = st.session_state.get("scout_view", "veille")
+    st.session_state["scout_view"] = "apropos" if cur == "veille" else "veille"
+
+
+def _select_theme(theme: str):
+    # Clic sur un bouton de theme (landing) -> pre-selectionne le selectbox
+    # et garantit l'affichage du tableau de bord Veille.
+    st.session_state["theme_select"] = theme
+    st.session_state["scout_view"] = "veille"
 
 
 # ─── Inject design CSS (palette + filterbar mode) ─────────────────────────────
@@ -2263,7 +2361,7 @@ st.markdown(
 )
 
 
-# ─── FILTERBAR (période | thèmes | MàJ | Activate Agent | dark | freeze) ─────
+# ─── FILTERBAR (période | thèmes | MàJ | À Propos/Veille DA | dark | freeze) ─
 with st.container(key="filter-row"):
     fb_cols = st.columns([1.5, 5.0, 1.5, 1.2, 0.5, 0.5], gap="small", vertical_alignment="center")
 
@@ -2281,11 +2379,14 @@ with st.container(key="filter-row"):
         )
 
     with fb_cols[1]:
+        # key="theme_select" -> permet aux boutons de theme du landing de pre-selectionner
+        # une valeur via st.session_state (callback _select_theme).
         selected_theme = st.selectbox(
             label="Thème",
             options=MEDIA_SCOUT_THEMES,
             index=None,
-            format_func=lambda t: f"{MEDIA_SCOUT_THEME_EMOJI.get(t, '')} {_theme_display(t)}",
+            key="theme_select",
+            format_func=_theme_display,  # _theme_display inclut deja l'emoji
             label_visibility="collapsed",
             placeholder="Choisir un thème",
         )
@@ -2306,7 +2407,26 @@ with st.container(key="filter-row"):
             )
 
     with fb_cols[3]:
-        answer_togg = st.toggle("Activate Agent", key="Search_togg", value=False, width="stretch")
+        # Bouton de navigation : libelle = la vue VERS laquelle on bascule.
+        # Cle distincte par etat -> styles CSS differents (contour vs rempli).
+        # Vue "veille" (defaut) -> bouton "À Propos" | Vue "apropos" -> "Veille DA"
+        _cur_view = st.session_state.get("scout_view", "veille")
+        if _cur_view == "veille":
+            st.button(
+                "À Propos",
+                key="nav_apropos",
+                help="En savoir plus sur l'agent de veille",
+                on_click=_toggle_view,
+                width="stretch",
+            )
+        else:
+            st.button(
+                "Veille DA",
+                key="nav_veille",
+                help="Revenir au tableau de bord de veille",
+                on_click=_toggle_view,
+                width="stretch",
+            )
 
     with fb_cols[4]:
         _is_dark = st.session_state.get("dark_mode", False)
@@ -2441,8 +2561,12 @@ components.html(
 
 
 # ─── CONTENT ──────────────────────────────────────────────────────────────────
-if answer_togg:
-    st.markdown("<br>", unsafe_allow_html=True)
+# Vue par defaut = "veille" (tableau de bord actif des l'ouverture, sans toggle).
+# La page "apropos" s'affiche uniquement si l'utilisateur clique sur « À Propos ».
+if st.session_state.get("scout_view", "veille") == "veille":
+    # Espace haut (masqué en mobile via .st-key-veille-top-spacer)
+    with st.container(key="veille-top-spacer"):
+        st.markdown("<br>", unsafe_allow_html=True)
 
     invalid_period = (
         not isinstance(date_select, tuple)
@@ -2456,9 +2580,55 @@ if answer_togg:
         issues.append("une période valide (date début + date fin)")
 
     if issues:
-        st.warning(
-            "Veuillez sélectionner " + " et ".join(issues) + " avant de lancer l'agent."
-        )
+        # Landing visuel : grands boutons (1 par thème) avec dégradé de couleur
+        # dédié + emoji en filigrane. Au clic, le thème est pré-sélectionné et le
+        # tableau de bord s'affiche. Disposition : 3 en haut, 2 centrés en bas.
+        # Espace haut (br) masqué en mobile via .st-key-landing-top-spacer (CSS).
+        with st.container(key="landing-top-spacer"):
+            st.markdown("<br>", unsafe_allow_html=True)
+
+        # CSS dynamique par thème : dégradé de fond (repos + hover) + filigrane emoji
+        _btn_visual_css = "<style>"
+        for _bi, _bt in enumerate(MEDIA_SCOUT_THEMES):
+            _c = _THEME_COLORS.get(_bt, "#A89060")
+            _em = MEDIA_SCOUT_THEME_EMOJI.get(_bt, "")
+            _btn_visual_css += (
+                f".st-key-theme_btn_{_bi} button{{"
+                f"background:linear-gradient(135deg, {_c}3A 0%, {_c}16 48%, var(--paper-3) 100%) !important;}}"
+                f".st-key-theme_btn_{_bi} button:hover{{"
+                f"background:linear-gradient(135deg, {_c}66 0%, {_c}2E 52%, var(--paper-3) 100%) !important;}}"
+                f".st-key-theme_btn_{_bi} button::after{{"
+                f"content:'{_em}'; position:absolute; right:-6px; bottom:-26px;"
+                f"font-size:104px; line-height:1; opacity:.18; z-index:0;"
+                f"pointer-events:none; transform:rotate(-6deg);}}"
+                f".st-key-theme_btn_{_bi} button:hover::after{{opacity:.30;}}"
+            )
+        _btn_visual_css += "</style>"
+        st.markdown(_btn_visual_css, unsafe_allow_html=True)
+
+        def _render_theme_btn(theme, idx):
+            st.button(
+                _theme_plain(theme),  # nom sans emoji (le filigrane fournit l'emoji)
+                key=f"theme_btn_{idx}",
+                on_click=_select_theme,
+                args=(theme,),
+                width="stretch",
+            )
+
+        _themes = MEDIA_SCOUT_THEMES
+        # Ligne 1 : 3 boutons
+        _row1 = st.columns(3, gap="medium")
+        for _j in range(min(3, len(_themes))):
+            with _row1[_j]:
+                _render_theme_btn(_themes[_j], _j)
+        # Ligne 2 : les 2 restants, centrés (largeur identique grâce aux spacers)
+        _rest = _themes[3:]
+        if _rest:
+            _row2 = st.columns([1, 2, 2, 1], gap="medium")
+            _slots = [_row2[1], _row2[2]]
+            for _k, _theme in enumerate(_rest[:2]):
+                with _slots[_k]:
+                    _render_theme_btn(_theme, 3 + _k)
     else:
         with st.spinner("Synthèse des signaux..."):
             media_data_df = data_media_scout(MEDIA_SCOUT_URLS, slot=current_cache_slot())
@@ -2555,7 +2725,7 @@ if answer_togg:
             )
 
 else:
-    # ── Présentation panels (toggle off) : 2 colonnes cote-a-cote ────────────
+    # ── Page À PROPOS : présentation de l'agent + sources de référence ───────
     st.markdown("<br>", unsafe_allow_html=True)
     pres_cols = st.columns(2, gap="medium")
     with pres_cols[0]:
@@ -2576,12 +2746,12 @@ else:
         st.markdown(
             """
 <div class="presentation-card">
-  <div class="eyebrow">Tester l'Agent</div>
+  <div class="eyebrow">Utiliser l'Agent</div>
   <ol>
+    <li>Cliquer sur <b>« Veille DA »</b> pour revenir au tableau de bord</li>
     <li>Sélectionner la <b>période</b> souhaitée (max 30 jours)</li>
     <li>Choisir le <b>thème</b> à couvrir (un seul à la fois)</li>
-    <li>Activer le toggle « Activate Agent »</li>
-    <li>Cliquer sur <b>Voir tout</b> d'un cadre pour explorer les articles regroupés par thème</li>
+    <li>Les actualités s'affichent <b>automatiquement</b> — cliquer sur <b>Voir tout</b> d'un cadre pour explorer les articles</li>
   </ol>
 </div>
 """,
