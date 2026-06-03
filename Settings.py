@@ -1,4 +1,3 @@
-import base64
 import html
 import json
 import os
@@ -41,11 +40,6 @@ current_dir = Path(__file__).parent if "__file__" in locals() else Path.cwd()
 css_file = current_dir / "main.css"
 
 
-def get_base64_of_bin_file(bin_file):
-    with open(bin_file, "rb") as f:
-        return base64.b64encode(f.read()).decode()
-
-
 def load_css():
     if css_file.exists():
         with open(css_file, encoding="utf-8") as f:
@@ -55,8 +49,8 @@ def load_css():
 
 MEDIA_SCOUT_THEMES = [
     "Agrumes, Fruits rouges & Maraichage",
-    "Elevage (Ovins, Bovins, Caprins, Volailles)",
     "Produits laitiers & Epicerie fine",
+    "Elevage (Ovins, Bovins, Caprins, Volailles)",
     "Environnement, Eau & Energie",
     "ESG, QSE & SST",
 ]
@@ -126,12 +120,9 @@ MEDIA_SCOUT_SOURCE_CATALOG = [
     {"Journal": "FreshFruitPortal",  "URL": "https://www.freshfruitportal.com/feed/", "Couverture": "Fruits frais mondial — marche, export, varietes"},
     {"Journal": "FruitNet",          "URL": "https://www.fruitnet.com/45.rss",        "Couverture": "Filiere fruits & legumes (international, trade)"},
 
-    # ─── CONCURRENTS LDA — Sites corporates (HTML pages presse) ────────────────
-    # Note: la majorite des sites corporates sont des SPA JS non scrapables
-    # (Groupe Bel, Ribambel, Nestlé MENA, Aïcha retires) — leurs marques sont
-    # couvertes par les flux Google News RSS ci-dessous. On garde seulement
-    # Lesieur Cristal (HTML statique avec contenu).
-    {"Journal": "Lesieur Cristal",  "URL": "https://lesieur-cristal.com/communication_financiere/communiques-de-presse/", "Couverture": "Concurrent epicerie fine Maroc — Huiles, condiments (CP financiers)"},
+    # ─── CONCURRENTS LDA — Sites corporates : TOUS retires (SPA JS / pages mortes,
+    # ex. Lesieur Cristal, Groupe Bel, Nestlé MENA, Aïcha). Marques concurrentes
+    # entierement couvertes par les flux Google News RSS ci-dessous. ────────────
 
     # ─── CONCURRENTS LDA — Google News RSS (one per cluster) ───────────────────
     # Feeds RSS XML standard, ultra-fiables. Chaque feed cible une marque ou un
@@ -154,12 +145,44 @@ MEDIA_SCOUT_SOURCE_CATALOG = [
     # (_LDA_COMPETITORS) — pas auto-classes T3. Le filtre post-scrape decide.
     {"Journal": "EcoActu",          "URL": "https://www.ecoactu.ma/feed/",       "Couverture": "Presse economique Maroc — entreprises, distribution, agro"},
     {"Journal": "Aujourd'hui Maroc","URL": "https://aujourdhui.ma/feed",         "Couverture": "Presse generaliste Maroc — economie, societe"},
-    {"Journal": "Challenge.ma",     "URL": "https://www.challenge.ma/feed/",     "Couverture": "Presse economique Maroc — affaires, entreprises"},
     {"Journal": "Financial Afrik",  "URL": "https://www.financialafrik.com/feed/", "Couverture": "Presse economique Afrique — agro, FMCG, distribution"},
 
+    # ─── VEILLE CONCURRENTIELLE T3 — Intelligence laitier & épicerie fine ──────
+    # Sources organisees en 5 categories (concept "Catégorie"). Feeds Google News
+    # consolides (topic-scopes sur le laitier/epicerie) + 2 presses MA en RSS direct.
+    # Toutes forcees T3 + ajoutees aux sources concurrentes (cf. app.py).
+    # C1 — Marché local & Maghreb
+    {"Journal": "GNews — Presse éco MA", "URL": "https://news.google.com/rss/search?q=(site:leconomiste.com+OR+site:medias24.com+OR+site:leseco.ma)+(laitier+OR+fromage+OR+yaourt+OR+lait+OR+%22epicerie+fine%22+OR+distribution+OR+Danone+OR+Chergui)&hl=fr&gl=MA&ceid=MA:fr", "Couverture": "C1 Marché local — L'Économiste, Medias24, Les Éco (agro/distrib)"},
+    {"Journal": "La Vie Éco",            "URL": "https://www.lavieeco.com/feed/",   "Couverture": "C1 Marché local — presse économique Maroc"},
+    {"Journal": "Le Matin",              "URL": "https://lematin.ma/rssFeed/0",     "Couverture": "C1 Marché local — presse généraliste Maroc"},
+    # C2 — Secteur laitier international
+    {"Journal": "GNews — Lait International", "URL": "https://news.google.com/rss/search?q=(%22prix+du+lait%22+OR+%22marche+laitier%22+OR+%22cotation+lait%22+OR+%22filiere+laitiere%22+OR+%22dairy+market%22)&hl=fr&ceid=:fr", "Couverture": "C2 Secteur laitier intl — cotations, marché mondial du lait"},
+    # C3 — FMCG, Retail & Distribution
+    {"Journal": "GNews — FMCG Retail",   "URL": "https://news.google.com/rss/search?q=(site:lsa-conso.fr+OR+site:lineaires.com+OR+site:nielseniq.com+OR+site:kantar.com)+(laitier+OR+yaourt+OR+fromage+OR+lait+OR+distribution+OR+rayon)&hl=fr&ceid=:fr", "Couverture": "C3 FMCG/Retail — LSA, Linéaires, NielsenIQ, Kantar (laitier)"},
+    # C4 — Nutrition fonctionnelle & Santé
+    {"Journal": "GNews — Nutrition Santé", "URL": "https://news.google.com/rss/search?q=(%22nutrition+fonctionnelle%22+OR+%22probiotique%22+OR+%22fortification%22+OR+%22allegation+sante%22)+(lait+OR+laitier+OR+yaourt+OR+fromage)&hl=fr&ceid=:fr", "Couverture": "C4 Nutrition/Santé — probiotiques, fortification, allégations"},
+    # C5 — Nouveautés produits & Marques premium
+    {"Journal": "GNews — Nouveautés Premium", "URL": "https://news.google.com/rss/search?q=(%22lancement%22+OR+%22nouveau+produit%22+OR+%22packaging%22)+(laitier+OR+fromage+OR+yaourt+OR+lait+OR+%22epicerie+fine%22)&hl=fr&ceid=:fr", "Couverture": "C5 Nouveautés/Premium — lancements, packaging, repositionnements"},
+
+    # ─── VEILLE CONCURRENTIELLE T1 — Agrumes, Fruits rouges & Tomates cerises ──
+    # Intelligence export fruits & primeurs LDA, organisee en 5 categories.
+    # Feeds Google News consolides (topic-scopes agrumes/fruits rouges/tomate
+    # cerise). Toutes forcees T1 + Veille Concurrentielle (cf. app.py profils).
+    # A1 — Marché Maroc (filiere & organismes export)
+    {"Journal": "GNews — Agrumes Export MA",   "URL": "https://news.google.com/rss/search?q=(%22Morocco+Foodex%22+OR+%22EACCE%22+OR+%22Maroc+Citrus%22+OR+%22ASPAM%22+OR+%22export+agrumes%22+OR+%22export+primeurs%22+OR+%22fruits+rouges%22)+Maroc&hl=fr&gl=MA&ceid=MA:fr", "Couverture": "A1 Marché Maroc — Morocco Foodex, EACCE, Maroc Citrus, export primeurs"},
+    # A2 — Export & marchés internationaux (cotations, campagnes, demande)
+    {"Journal": "GNews — Marché Agrumes Intl", "URL": "https://news.google.com/rss/search?q=(%22citrus+market%22+OR+%22orange+price%22+OR+%22marche+agrumes%22+OR+%22campagne+agrumes%22+OR+%22citrus+export%22+OR+%22soft+citrus%22)&hl=fr&ceid=:fr", "Couverture": "A2 Export & marchés — cotations agrumes, campagnes, demande mondiale"},
+    {"Journal": "GNews — Marché Fruits Rouges","URL": "https://news.google.com/rss/search?q=(%22berry+market%22+OR+%22blueberry%22+OR+%22strawberry+market%22+OR+%22marche+fruits+rouges%22+OR+%22soft+fruit%22)+(export+OR+prix+OR+marche)&hl=fr&ceid=:fr", "Couverture": "A2 Export & marchés — marché mondial des fruits rouges (berries)"},
+    # A3 — Concurrents (exportateurs rivaux primeurs/fruits)
+    {"Journal": "GNews — Concurrents Primeurs","URL": "https://news.google.com/rss/search?q=(%22Azura+Group%22+OR+%22Groupe+Azura%22+OR+%22Delassus%22+OR+%22Duroc%22+OR+%22Maraissa%22+OR+%22Disma+International%22+OR+%22Zalar%22+OR+%22Rosaflor%22+OR+%22Agrumar%22)&hl=fr&ceid=:fr", "Couverture": "A3 Concurrents — Azura, Delassus, Duroc, Maraissa, Zalar, Rosaflor, Agrumar"},
+    # A4 — Filière & production (varietes, conditionnement, eau, regions)
+    {"Journal": "GNews — Production Fruits MA","URL": "https://news.google.com/rss/search?q=(%22station+de+conditionnement%22+OR+%22variete+agrumes%22+OR+%22Nadorcott%22+OR+%22stress+hydrique%22+OR+%22verger%22+OR+%22Souss-Massa%22)+(agrumes+OR+fraise+OR+tomate)&hl=fr&gl=MA&ceid=MA:fr", "Couverture": "A4 Filière & production — variétés, conditionnement, eau, Souss-Massa"},
+    # A5 — Variétés & premium (innovation produit, packaging)
+    {"Journal": "GNews — Innovations Fruits",  "URL": "https://news.google.com/rss/search?q=(%22nouvelle+variete%22+OR+%22club+variety%22+OR+%22licence+varietale%22+OR+%22fruit+premium%22+OR+%22packaging%22)+(agrume+OR+fraise+OR+myrtille+OR+%22tomate+cerise%22)&hl=fr&ceid=:fr", "Couverture": "A5 Variétés & premium — nouvelles variétés, club varieties, packaging"},
+
     # ─── WORLD - Elevage (ovin/bovin/caprin/volaille) ──────────────────────────
-    # NB: Poultry World (SPA) retire -> aviculture couverte par GNews Aviculture MA.
-    {"Journal": "WOAH (OIE)",   "URL": "https://www.woah.org/en/news/",       "Couverture": "Sante animale, elevage, epizooties"},
+    # NB: Poultry World + WOAH/OIE (SPA, 0 article) retires -> elevage couvert par
+    # les flux GNews (Betail / Aviculture / Viande MA) + AgriMaroc Élevage.
     {"Journal": "DairyReporter","URL": "https://www.dairyreporter.com/",      "Couverture": "Filiere laitiere mondiale"},
     # AgriMaroc - section dediee elevage (en plus de la categorie generale)
     {"Journal": "AgriMaroc Élevage", "URL": "https://www.agrimaroc.ma/category/elevage/", "Couverture": "Elevage Maroc — ovins, bovins, caprins, volailles"},
@@ -174,6 +197,8 @@ MEDIA_SCOUT_SOURCE_CATALOG = [
     {"Journal": "GNews — Viande MA",       "URL": "https://news.google.com/rss/search?q=(%22filiere+viande%22+OR+%22viande+ovine%22+OR+%22viande+bovine%22+OR+%22abattoir%22+OR+%22marche+ovin%22)+Maroc&hl=fr&gl=MA&ceid=MA:fr", "Couverture": "Elevage MA — Filiere viande, abattoirs, marche ovin"},
     {"Journal": "GNews — ANOC FIVOB",       "URL": "https://news.google.com/rss/search?q=(%22ANOC%22+OR+%22FIVOB%22+OR+%22FISA%22+OR+%22FIMABE%22+OR+%22INTERPROVI%22)+Maroc&hl=fr&gl=MA&ceid=MA:fr",                    "Couverture": "Elevage MA — Federations interprofessionnelles betail"},
     {"Journal": "GNews — Lait Maroc",       "URL": "https://news.google.com/rss/search?q=(%22filiere+laitiere%22+OR+%22production+laitiere%22+OR+%22vache+laitiere%22+OR+%22centres+collecte+lait%22)+Maroc&hl=fr&gl=MA&ceid=MA:fr",  "Couverture": "Elevage MA — Filiere laitiere, vaches laitieres"},
+    {"Journal": "GNews — Aquaculture MA",   "URL": "https://news.google.com/rss/search?q=(%22aquaculture%22+OR+%22pisciculture%22+OR+%22conchyliculture%22+OR+%22ostreiculture%22+OR+%22ANDA%22)+Maroc&hl=fr&gl=MA&ceid=MA:fr", "Couverture": "Elevage MA — Aquaculture, pisciculture, conchyliculture"},
+    {"Journal": "GNews — Peche Aquaculture","URL": "https://news.google.com/rss/search?q=(%22peche%22+OR+%22halieutique%22+OR+%22produits+de+la+mer%22+OR+%22Halieutis%22)+Maroc+aquaculture&hl=fr&gl=MA&ceid=MA:fr", "Couverture": "Elevage MA — Pêche & aquaculture, produits de la mer"},
 
     # ─── WORLD - Environnement / Climat / Energie ──────────────────────────────
     # NB: retires car SPA/404/502 (0 article) : UNEP, WRI, TNFD, SBTi, CDP,
@@ -256,7 +281,6 @@ MEDIA_SCOUT_DOMAIN_THEME_OVERRIDES = {
     "globalgap.org":                  "Agrumes, Fruits rouges & Maraichage",
     "food.ec.europa.eu":              "Agrumes, Fruits rouges & Maraichage",
     # Elevage (filieres animales : ovin, bovin, caprin, volaille)
-    "woah.org":                       "Elevage (Ovins, Bovins, Caprins, Volailles)",
     "poultryworld.net":               "Elevage (Ovins, Bovins, Caprins, Volailles)",
     # Produits laitiers & Epicerie fine (filiere laitiere + food industry global)
     "dairyreporter.com":              "Produits laitiers & Epicerie fine",
@@ -266,8 +290,6 @@ MEDIA_SCOUT_DOMAIN_THEME_OVERRIDES = {
     "groupe-bel.com":                 "Produits laitiers & Epicerie fine",
     "ribambel.com":                   "Produits laitiers & Epicerie fine",
     "aicha.com":                      "Produits laitiers & Epicerie fine",
-    "lesieur-cristal.com":            "Produits laitiers & Epicerie fine",
-    "lesieur-cristal.ma":             "Produits laitiers & Epicerie fine",  # legacy
     # NB: news.google.com PAS dans le domain override car les feeds GNews
     # couvrent plusieurs themes (T2 elevage ET T3 laitier). Le theme par feed
     # est gere via MEDIA_SCOUT_FORCED_SOURCE_THEMES (par nom de source).
@@ -275,49 +297,43 @@ MEDIA_SCOUT_DOMAIN_THEME_OVERRIDES = {
 
 MEDIA_SCOUT_THEME_RULES = {
     "Agrumes, Fruits rouges & Maraichage": {
+        # THEME RECENTRE (v29) sur les 3 filieres d'EXPORT phares LDA :
+        # Agrumes · Fruits rouges · Tomates cerises. Le maraichage generique
+        # (courgette, poivron, salade, oignon...) et les termes vegetaux larges
+        # ont ete retires pour ameliorer la pertinence des veilles.
         "strong": [
-            # Agrumes
+            # ── Agrumes ──
             "agrume", "agrumes", "orange", "oranges", "mandarine", "mandarines",
             "clementine", "clementines", "citron", "citrons", "pamplemousse", "pamplemousses",
             "pomelo", "lime", "kumquat", "bergamote", "filiere agrumes", "citrus",
-            "citron vert", "navel", "valencia", "maroc late",
-            # Fruits rouges
+            "citron vert", "navel", "valencia", "maroc late", "nadorcott", "afourer",
+            "soft citrus", "maroc citrus",
+            # ── Fruits rouges ──
             "fruits rouges", "fruit rouge", "fraise", "fraises", "framboise", "framboises",
             "myrtille", "myrtilles", "mure", "mures", "cassis", "groseille", "groseilles",
             "berries", "berry", "strawberry", "raspberry", "blueberry", "blackberry",
-            "cranberry", "filiere fraise", "petits fruits",
-            # Maraichage / legumes
-            "maraichage", "maraicher", "maraichers", "maraichere", "primeur", "primeurs",
-            "horticulture", "tomate", "tomates", "courgette", "courgettes",
-            "aubergine", "aubergines", "poivron", "poivrons", "piment", "concombre",
-            "concombres", "salade", "laitue", "oignon", "oignons", "ail", "carotte",
-            "carottes", "pomme de terre", "haricot vert", "petit pois", "epinard",
-            "chou", "brocoli", "artichaut", "asperge", "asperges", "navet", "radis",
-            "courge", "potiron", "melon", "melons", "pasteque", "raisin de table",
-            "fruit", "fruits", "legume", "legumes", "vegetable", "vegetables",
-            "transformation fruit", "transformation legume", "conserverie fruits",
-            "filiere fruits et legumes", "FELCOOP", "interfel",
+            "cranberry", "filiere fraise", "petits fruits", "soft fruit", "soft fruits",
+            # ── Tomates cerises ──
+            "tomate cerise", "tomates cerises", "tomate-cerise", "tomates-cerises",
+            "cherry tomato", "cherry tomatoes", "tomate", "tomates", "tomato",
+            "tomate ronde", "tomate grappe", "tomate cocktail", "filiere tomate",
         ],
         "medium": [
-            # Pratiques de production vegetale
-            "verger", "vergers", "plantation", "exploitation", "serre", "serres",
-            "plein champ", "parcelle", "irrigation goutte a goutte", "irrigation localisee",
-            "semence", "semences", "engrais", "fertilisant", "fertilisants",
-            "pesticide", "pesticides", "phytosanitaire", "traitement phytosanitaire",
-            "recolte", "moisson", "campagne agricole", "campagne", "cueillette",
-            "calibrage", "conditionnement fruit", "station de conditionnement",
-            "chaine du froid", "post-recolte", "post recolte", "stockage frigo",
-            "exportation fruits", "exportation legumes", "agroexport",
-            "morocco foodex", "moroccan exports",
-            # Generique agriculture vegetale (pour rester capter les actus generales)
-            "agriculture", "agricole", "agroecologie", "agriculture biologique",
-            "permaculture", "cooperative agricole", "cooperative", "sol agricole",
-            "terre arable", "culture", "champ", "harvest", "crop", "farming",
-            "agronomie", "production vegetale", "plan maroc vert", "generation green",
-            "comader", "ada agence", "ormvar", "ormva",
+            # Production / conditionnement / export des 3 filieres ciblees
+            "verger", "vergers", "plantation", "serre", "serres", "plein champ",
+            "irrigation goutte a goutte", "irrigation localisee", "station de conditionnement",
+            "conditionnement", "calibrage", "recolte", "cueillette", "campagne agrumes",
+            "campagne d'export", "chaine du froid", "post-recolte", "post recolte",
+            "stockage frigo", "exportation fruits", "exportation legumes", "agroexport",
+            "primeurs", "morocco foodex", "moroccan exports", "eacce", "aspam", "apefel",
+            "fruits et legumes", "felcoop", "interfel", "agriculture biologique",
         ],
+        # Agriculture generique en WEAK : ne qualifie PAS seule pour T1 (le theme
+        # exige desormais une culture cible OU un signal export) -> focus renforce.
         "weak": [
-            "agri", "production agricole",
+            "agri", "agriculture", "agricole", "production agricole", "production vegetale",
+            "agronomie", "cooperative agricole", "exploitation agricole", "campagne agricole",
+            "plan maroc vert", "generation green", "comader",
         ],
     },
     "Elevage (Ovins, Bovins, Caprins, Volailles)": {
@@ -354,11 +370,19 @@ MEDIA_SCOUT_THEME_RULES = {
             # Filiere viande / abattage Maroc
             "sonacos", "filiere des viandes", "viande ovine",
             "viande bovine", "viande caprine", "viande avicole",
+            # Aquaculture / pisciculture (filiere ajoutee)
+            "aquaculture", "aquacole", "filiere aquacole", "ferme aquacole",
+            "pisciculture", "piscicole", "elevage piscicole", "ferme piscicole",
+            "elevage de poissons", "fish farming", "salmoniculture", "conchyliculture",
+            "ostreiculture", "mytiliculture", "huitre", "huitres", "moule", "moules",
+            "crevette", "crevettes", "daurade", "dorade", "bar ", "loup de mer",
+            "saumon d'elevage", "tilapia", "anda", "halieutique", "produits de la mer",
         ],
         "medium": [
             "animal", "animale", "animaux", "troupeau", "troupeaux", "cheptel",
             "boucher", "boucherie", "feed", "ferme d'elevage", "exploitation d'elevage",
             "production animale", "filiere animale",
+            "poisson", "poissons", "fruits de mer", "algue", "algues",
         ],
         "weak": [
             "race animale",
@@ -693,8 +717,6 @@ MEDIA_SCOUT_FORCED_SOURCE_THEMES = {
     # ── UE - Food industry (couverture globale, pas locale) ───────────────
     "Food Navigator":                   "Produits laitiers & Epicerie fine",
 
-    # ── CONCURRENTS LDA — sites corporates HTML (forces T3)
-    "Lesieur Cristal":                  "Produits laitiers & Epicerie fine",
     # ── CONCURRENTS LDA — Google News RSS aggregated feeds (forces T3)
     "GNews — Centrale Danone":          "Produits laitiers & Epicerie fine",
     "GNews — COPAG Jaouda":             "Produits laitiers & Epicerie fine",
@@ -707,15 +729,28 @@ MEDIA_SCOUT_FORCED_SOURCE_THEMES = {
     "GNews — Hero St Dalfour":          "Produits laitiers & Epicerie fine",
     "GNews — Olive MA":                 "Produits laitiers & Epicerie fine",
     "GNews — Sovena Puget":             "Produits laitiers & Epicerie fine",
+    # ── VEILLE CONCURRENTIELLE T3 — Intelligence par categorie (forces T3) ──
+    # (topic-scopes sur le laitier/epicerie -> forcage T3 sans bruit)
+    "GNews — Presse éco MA":            "Produits laitiers & Epicerie fine",
+    "GNews — Lait International":        "Produits laitiers & Epicerie fine",
+    "GNews — FMCG Retail":              "Produits laitiers & Epicerie fine",
+    "GNews — Nutrition Santé":          "Produits laitiers & Epicerie fine",
+    "GNews — Nouveautés Premium":       "Produits laitiers & Epicerie fine",
+    # ── VEILLE CONCURRENTIELLE T1 — Agrumes / Fruits rouges / Tomates cerises ──
+    "GNews — Agrumes Export MA":        "Agrumes, Fruits rouges & Maraichage",
+    "GNews — Marché Agrumes Intl":      "Agrumes, Fruits rouges & Maraichage",
+    "GNews — Marché Fruits Rouges":     "Agrumes, Fruits rouges & Maraichage",
+    "GNews — Concurrents Primeurs":     "Agrumes, Fruits rouges & Maraichage",
+    "GNews — Production Fruits MA":     "Agrumes, Fruits rouges & Maraichage",
+    "GNews — Innovations Fruits":       "Agrumes, Fruits rouges & Maraichage",
     # ── PRESSE ÉCONOMIQUE MAROC RSS (PAS forces — classification naturelle)
-    # NB: EcoActu / Aujourd'hui Maroc / Challenge / Financial Afrik ne sont
-    # PAS dans ce dict -> theme decide par keywords + LLM validator
+    # NB: EcoActu / Aujourd'hui Maroc / Challenge / Financial Afrik / La Vie Éco
+    # / Le Matin ne sont PAS dans ce dict -> theme decide par keywords + LLM
 
     # ── WORLD - Agriculture (production vegetale OU elevage selon contenu) ─
     # FAO Newsroom : non force, couvre veg + elevage -> scoring decide
 
-    # ── WORLD - Elevage (ovin/bovin/caprin/volaille) ──────────────────────
-    "WOAH (OIE)":                       "Elevage (Ovins, Bovins, Caprins, Volailles)",
+    # ── WORLD - Elevage / Laitier ─────────────────────────────────────────
     "DairyReporter":                    "Produits laitiers & Epicerie fine",
     # ── MAROC - Elevage (sources dediees) ─────────────────────────────────
     "AgriMaroc Élevage":                "Elevage (Ovins, Bovins, Caprins, Volailles)",
@@ -725,6 +760,8 @@ MEDIA_SCOUT_FORCED_SOURCE_THEMES = {
     "GNews — Viande MA":                "Elevage (Ovins, Bovins, Caprins, Volailles)",
     "GNews — ANOC FIVOB":               "Elevage (Ovins, Bovins, Caprins, Volailles)",
     "GNews — Lait Maroc":               "Elevage (Ovins, Bovins, Caprins, Volailles)",
+    "GNews — Aquaculture MA":           "Elevage (Ovins, Bovins, Caprins, Volailles)",
+    "GNews — Peche Aquaculture":        "Elevage (Ovins, Bovins, Caprins, Volailles)",
 
     # ── WORLD - Environnement / Climat / Energie (sources qui marchent) ───
     "Climate Home News":                "Environnement, Eau & Energie",
@@ -773,11 +810,9 @@ MEDIA_SCOUT_SOURCE_ORIGINS = {
     "IMANOR": "Maroc",
     "AMMC": "Maroc",
     "Aïcha": "Maroc",
-    "Lesieur Cristal": "Maroc",
     # Presse economique Maroc (RSS)
     "EcoActu": "Maroc",
     "Aujourd'hui Maroc": "Maroc",
-    "Challenge.ma": "Maroc",
 
     # France (couvertures UE / globales uniquement)
     "AFNOR Actualites": "France",
@@ -804,6 +839,23 @@ MEDIA_SCOUT_SOURCE_ORIGINS = {
     "GNews — Viande MA": "International",
     "GNews — ANOC FIVOB": "International",
     "GNews — Lait Maroc": "International",
+    "GNews — Aquaculture MA": "International",
+    "GNews — Peche Aquaculture": "International",
+    # Veille Concurrentielle T3 — intelligence par categorie
+    "GNews — Presse éco MA": "Maroc",
+    "La Vie Éco": "Maroc",
+    "Le Matin": "Maroc",
+    "GNews — Lait International": "International",
+    "GNews — FMCG Retail": "International",
+    "GNews — Nutrition Santé": "International",
+    "GNews — Nouveautés Premium": "International",
+    # Veille Concurrentielle T1 — Agrumes / Fruits rouges / Tomates cerises
+    "GNews — Agrumes Export MA": "Maroc",
+    "GNews — Marché Agrumes Intl": "International",
+    "GNews — Marché Fruits Rouges": "International",
+    "GNews — Concurrents Primeurs": "International",
+    "GNews — Production Fruits MA": "Maroc",
+    "GNews — Innovations Fruits": "International",
     # Google News RSS - BACKFILL T4 Environnement + T5 Normes
     "GNews — Eau Maroc": "International",
     "GNews — Energie Maroc": "International",
@@ -854,7 +906,6 @@ MEDIA_SCOUT_SOURCE_ORIGINS = {
     "ISO 14001": "International",
     "ISO 14000 Family": "International",
     "FAO Newsroom": "International",
-    "WOAH (OIE)": "International",
     "UN Global Compact": "International",
     "OECD RBC": "International",
     "WHO News": "International",
@@ -900,11 +951,9 @@ MEDIA_SCOUT_SOURCE_ZONES = {
     "IMANOR":                                 "MAROC",
     "AMMC":                                   "MAROC",
     "Aïcha":                                  "MAROC",
-    "Lesieur Cristal":                        "MAROC",
     # Presse economique Maroc (RSS)
     "EcoActu":                                "MAROC",
     "Aujourd'hui Maroc":                      "MAROC",
-    "Challenge.ma":                           "MAROC",
 
     # EU (couvertures globales / directives impactant Maroc)
     "EFSA":                                   "EU",
@@ -927,12 +976,29 @@ MEDIA_SCOUT_SOURCE_ZONES = {
     "GNews — Hero St Dalfour":                "WORLD",
     "GNews — Olive MA":                       "WORLD",
     "GNews — Sovena Puget":                   "WORLD",
+    # Veille Concurrentielle T3 — intelligence par categorie
+    "GNews — Presse éco MA":                  "MAROC",
+    "La Vie Éco":                             "MAROC",
+    "Le Matin":                               "MAROC",
+    "GNews — Lait International":              "WORLD",
+    "GNews — FMCG Retail":                    "WORLD",
+    "GNews — Nutrition Santé":                "WORLD",
+    "GNews — Nouveautés Premium":             "WORLD",
+    # Veille Concurrentielle T1 — Agrumes / Fruits rouges / Tomates cerises
+    "GNews — Agrumes Export MA":              "MAROC",
+    "GNews — Marché Agrumes Intl":            "WORLD",
+    "GNews — Marché Fruits Rouges":           "WORLD",
+    "GNews — Concurrents Primeurs":           "WORLD",
+    "GNews — Production Fruits MA":           "MAROC",
+    "GNews — Innovations Fruits":             "WORLD",
     # Google News RSS - Elevage MA (forces T2 - betail strict)
     "GNews — Bétail MA":                      "WORLD",
     "GNews — Aviculture MA":                  "WORLD",
     "GNews — Viande MA":                      "WORLD",
     "GNews — ANOC FIVOB":                     "WORLD",
     "GNews — Lait Maroc":                     "WORLD",
+    "GNews — Aquaculture MA":                 "WORLD",
+    "GNews — Peche Aquaculture":              "WORLD",
     # Google News RSS - BACKFILL T4 Environnement + T5 Normes
     "GNews — Eau Maroc":                      "WORLD",
     "GNews — Energie Maroc":                  "WORLD",
@@ -950,7 +1016,6 @@ MEDIA_SCOUT_SOURCE_ZONES = {
     "FAO Newsroom":                           "WORLD",
     "Codex Alimentarius":                     "WORLD",
     "GlobalG.A.P.":                           "WORLD",
-    "WOAH (OIE)":                             "WORLD",
     "DairyReporter":                          "WORLD",
     "Poultry World":                          "WORLD",
     "UNEP":                                   "WORLD",
@@ -1566,10 +1631,7 @@ _FILTER_OTHER_ANIMALS_MARKERS = (
     # Apiculture (elevage d'abeilles - distinct de miel produit fini)
     "apicult", "apiculteur", "apicultrice", "elevage d'abeilles", "elevage abeille",
     "ruche", "ruches", "filiere apicole",
-    # Pisciculture / aquaculture
-    "pisciculture", "piscicole", "aquaculture", "salmoniculture",
-    "elevage piscicole", "ferme aquacole", "fish farming", "elevage de poissons",
-    "filiere aquacole", "filiere piscicole",
+    # NB: pisciculture / aquaculture NE SONT PLUS exclues (theme T2 etendu a l'aquaculture)
     # Cunicole (lapin)
     " lapin ", " lapins ", "cuniculture", "cunicole", "filiere cunicole",
     " lievre ", " lievres ", "elevage cunicole", "viande de lapin",
@@ -1608,6 +1670,16 @@ _FILTER_AUTO_MARKERS = (
     "vehicule electrique", "voiture electrique", "bornes de recharge",
     "moteur thermique", "moteur diesel", "moteur essence",
     "f1 ", "formule 1", "moto gp", "rallye dakar",
+)
+
+# Fast-food / restauration rapide (hors scope : LDA = production agro, pas resto)
+_FILTER_FASTFOOD_MARKERS = (
+    "fast food", "fast-food", "fastfood", "restauration rapide", "junk food",
+    "malbouffe", "drive-in", "drive in", "fried chicken", "burger ",
+    "hamburger", "cheeseburger", "nuggets", "menu enfant",
+    "mcdonald", "mcdo ", "burger king", " kfc", "kfc ", "quick burger",
+    "subway", "pizza hut", "domino's", "dominos pizza", "five guys",
+    "starbucks", "chicken nuggets",
 )
 
 _FILTER_HEALTH_PURE_MARKERS = (
@@ -1719,6 +1791,11 @@ def _should_exclude_article(row) -> bool:
     desc = _fold_media_text(desc_raw)
     text = title + " " + desc
 
+    # Filtre 0bis : commentaires de blog (flux WordPress incluant les commentaires)
+    # Ex : "Commentaires sur ... par X" -> bruit, jamais un article de fond.
+    if title.startswith(("commentaires sur ", "commentaire sur ", "comments on ")):
+        return True
+
     # Filtre 1 : remerciements / hommages
     if any(m in text for m in _FILTER_REMERCIEMENT_MARKERS):
         return True
@@ -1740,6 +1817,10 @@ def _should_exclude_article(row) -> bool:
 
     # Filtre 4 : automobile
     if any(m in text for m in _FILTER_AUTO_MARKERS):
+        return True
+
+    # Filtre 4bis : fast-food / restauration rapide (hors scope production agro)
+    if any(m in padded for m in _FILTER_FASTFOOD_MARKERS):
         return True
 
     # Filtre 5 : ONCF (rail Maroc hors scope LDA)
@@ -1793,6 +1874,12 @@ _T2_LIVESTOCK_SPECIES = (
     "aid al adha", "aid el adha", "aid el kebir", "aid kebir",
     "aid adha", "eid al adha", "eid el kebir", "fete du sacrifice",
     "sacrifice du mouton", "tabaski", "souk al kbach", "souk kbach",
+    # Aquaculture / pisciculture (filiere ajoutee au scope T2)
+    "aquaculture", "aquacole", "pisciculture", "piscicole", "salmoniculture",
+    "conchyliculture", "ostreiculture", "mytiliculture", "halieutique",
+    "poisson", "poissons", "huitre", "huitres", "moule", "moules",
+    "crevette", "crevettes", "daurade", "dorade", "tilapia", "saumon",
+    "produits de la mer", "fruits de mer", "fish farming", "anda",
     # Federations
     "anoc", "fivob", "fisa ", "fimabe", "interprovi", "sonacos",
 )
@@ -1878,6 +1965,113 @@ def _t2_is_foreign_focused(title_folded: str) -> bool:
     return False
 
 
+# ── Garde-fou T1 : recentrage Agrumes / Fruits rouges / Tomates cerises ──────
+# Un article classe T1 portant sur une culture HORS cible (cereale, ou autre
+# maraichage : aubergine, courgette, pomme de terre...) SANS mentionner de
+# culture cible NI de sujet filiere/export large qui les englobe est demote hors
+# T1. Evite "Ble tendre : ...", "Aubergine : ...", tout en gardant les sujets
+# globaux ("export de fruits et legumes", "Morocco Foodex"...).
+_T1_TARGET_CROPS = (
+    # Agrumes
+    "agrume", "agrumes", "orange", "oranges", "mandarine", "mandarines",
+    "clementine", "clementines", "citron", "citrons", "pamplemousse", "pamplemousses",
+    "pomelo", "kumquat", "bergamote", "citrus", "navel", "valencia",
+    "nadorcott", "afourer", "maroc late", "soft citrus", "maroc citrus", "agrumicole",
+    # Fruits rouges
+    "fruits rouges", "fruit rouge", "fraise", "fraises", "framboise", "framboises",
+    "myrtille", "myrtilles", "mure", "mures", "cassis", "groseille", "groseilles",
+    "berries", "berry", "strawberry", "raspberry", "blueberry", "blackberry",
+    "cranberry", "petits fruits", "soft fruit", "soft fruits",
+    # Tomates (cerises)
+    "tomate", "tomates", "tomato", "tomatoes", "cherry tomato",
+)
+# Sujets filiere / export LARGES qui englobent les cultures cibles -> a garder.
+_T1_SECTOR_TERMS = (
+    "fruits et legumes", "fruit et legume", "primeur", "primeurs",
+    "morocco foodex", "moroccan exports", "agroexport", "agro-export",
+    "export agricole", "exportation agricole", "exportations agricoles",
+    "fresh produce", "fruit and vegetable", "fruits and vegetables",
+    "eacce", "aspam", "apefel",
+)
+# Cultures HORS cible (cereales / grandes cultures + autres maraichages).
+_T1_OFF_TARGET_CROPS = (
+    # Cereales / grandes cultures
+    "ble", "ble tendre", "ble dur", "cereale", "cereales", "orge", "riz",
+    "avoine", "sorgho", "tournesol", "colza", "betterave", "canne a sucre",
+    "legumineuse", "legumineuses", "pois chiche", "feve", "feves",
+    # Autres maraichages hors cible
+    "aubergine", "aubergines", "courgette", "courgettes", "poivron", "poivrons",
+    "piment", "piments", "concombre", "concombres", "salade", "laitue",
+    "oignon", "oignons", "ail", "carotte", "carottes", "pomme de terre",
+    "patate", "patates", "haricot", "haricots", "petit pois", "epinard", "epinards",
+    "chou", "choux", "brocoli", "artichaut", "artichauts", "asperge", "asperges",
+    "navet", "navets", "radis", "courge", "courges", "potiron", "melon", "melons",
+    "pasteque", "pasteques", "fenouil", "poireau", "poireaux", "celeri", "gombo", "okra",
+)
+
+
+def _t1_is_off_target(text_folded: str) -> bool:
+    """True si l'article doit etre demote hors T1 : il porte sur une culture hors
+    cible (cereale / autre maraichage) SANS mentionner de culture cible (agrumes /
+    fruits rouges / tomate) ni de sujet filiere-export large qui les englobe.
+
+    NB : `text_folded` = titre + description SEULEMENT (jamais le nom de source,
+    sinon des sources nommees "...Agrumes...", "...Fruits..." injecteraient un mot
+    cible et neutraliseraient la garde). Word-boundary matching (ble != table).
+    """
+    # 1) Culture cible presente -> jamais demote
+    for kw in _T1_TARGET_CROPS:
+        if _keyword_in_media_text(text_folded, kw):
+            return False
+    # 2) Sujet filiere/export large qui englobe les cibles -> garde
+    for kw in _T1_SECTOR_TERMS:
+        if _keyword_in_media_text(text_folded, kw):
+            return False
+    # 3) Hors-cible explicite (cereale / autre maraichage) -> demote
+    for kw in _T1_OFF_TARGET_CROPS:
+        if _keyword_in_media_text(text_folded, kw):
+            return True
+    return False
+
+
+# ── Garde-fou T3 : recentrage Produits laitiers & Épicerie fine ──────────────
+# Un article classe T3 portant sur l'EQUIPEMENT / la TECHNO de transformation
+# agroalimentaire (JBT, Marel, GEA, Tetra Pak, "technologies alimentaires"...)
+# est demote hors T3. Deux niveaux :
+#   • Fabricant d'equipement nomme -> demote TOUJOURS (l'article est centre
+#     equipement, meme s'il evoque le secteur "dairy").
+#   • Terme techno/process generique -> demote SEULEMENT si aucun produit ni
+#     marque laitier/epicerie n'est cite (sinon on garde, ex. "ligne de yaourt
+#     chez Danone"). Les news concurrentielles (Danone, Lactalis...) restent.
+_T3_EQUIP_MAKERS = (
+    "jbt", "marel", "gea group", "tetra pak", "tetrapak", "sidel", "krones",
+    "spx flow", "alfa laval", "buhler", "multivac",
+)
+_T3_EQUIP_TERMS = (
+    "equipementier", "machine d'emballage", "machines d'emballage",
+    "ligne de conditionnement", "ligne de production", "ligne d'embouteillage",
+    "process technology", "processing equipment", "processing technology",
+    "food processing equipment", "technologie alimentaire", "technologies alimentaires",
+    "foodtech", "food tech", "agritech", "automatisation industrielle",
+)
+
+
+def _t3_is_off_target(text_folded: str) -> bool:
+    """True si l'article doit etre demote hors T3 (equipement / techno de
+    transformation), False sinon. Voir le commentaire ci-dessus pour la regle.
+    """
+    # 1) Fabricant d'equipement nomme -> centre equipement -> demote
+    for kw in _T3_EQUIP_MAKERS:
+        if _keyword_in_media_text(text_folded, kw):
+            return True
+    # 2) Terme techno/process generique : demote seulement si AUCUN produit/marque
+    if any(_keyword_in_media_text(text_folded, kw) for kw in _T3_EQUIP_TERMS):
+        strong = MEDIA_SCOUT_THEME_RULES["Produits laitiers & Epicerie fine"]["strong"]
+        if not any(_keyword_in_media_text(text_folded, kw) for kw in strong):
+            return True
+    return False
+
+
 def _assign_media_theme(row):
     """Classification par mots-cles avec fallbacks defensifs.
 
@@ -1897,6 +2091,10 @@ def _assign_media_theme(row):
     source_context = _fold_media_text(" ".join([website_name, str(row.get("Link", ""))]))
     title_text = _fold_media_text(row.get("Title", ""))
     body_text = _fold_media_text(" ".join([str(row.get("Description", "")), website_name, str(row.get("Link", ""))]))
+    # Texte "propre" titre + description (SANS nom de source ni lien) pour les
+    # gardes T1/T3 -> evite que les sources nommees ("Agrumes...", "Lait...")
+    # injectent un mot cible et faussent la garde.
+    guard_text = title_text + " " + _fold_media_text(row.get("Description", ""))
 
     candidates = {}
     for theme in MEDIA_SCOUT_THEME_RULES:
@@ -1905,6 +2103,8 @@ def _assign_media_theme(row):
             candidates[theme] = result
 
     T2 = "Elevage (Ovins, Bovins, Caprins, Volailles)"
+    T1 = "Agrumes, Fruits rouges & Maraichage"
+    T3 = "Produits laitiers & Epicerie fine"
 
     # Helper : verifie qu'un candidat T2 passe les 2 gardes (especes + geo)
     def _t2_passes_guards():
@@ -1914,6 +2114,17 @@ def _assign_media_theme(row):
             return False
         return True
 
+    # Garde-fou par theme : T1 recentre (cultures cibles), T2 betail,
+    # T3 produits laitiers/epicerie (hors equipement/techno). Defaut : OK.
+    def _guard_ok(theme):
+        if theme == T2:
+            return _t2_passes_guards()
+        if theme == T1:
+            return not _t1_is_off_target(guard_text)
+        if theme == T3:
+            return not _t3_is_off_target(guard_text)
+        return True
+
     if candidates:
         sorted_candidates = sorted(
             candidates.items(),
@@ -1921,10 +2132,13 @@ def _assign_media_theme(row):
             reverse=True,
         )
         best = sorted_candidates[0][0]
-        # Garde-fou T2 : reroute si pas d'espece OU focus pays etranger
-        if best == T2 and not _t2_passes_guards():
-            if len(sorted_candidates) > 1:
-                return sorted_candidates[1][0]
+        # Garde-fou : si le meilleur candidat echoue sa garde (T1 hors cible OU
+        # T2 sans espece/focus etranger), reroute vers le prochain candidat qui
+        # passe la sienne, sinon "Autres".
+        if not _guard_ok(best):
+            for cand, _ in sorted_candidates[1:]:
+                if _guard_ok(cand):
+                    return cand
             return "Autres"
         return best
 
@@ -1932,8 +2146,8 @@ def _assign_media_theme(row):
     # dont 99% des articles sont sur leur theme par definition).
     for domain, theme in MEDIA_SCOUT_DOMAIN_THEME_OVERRIDES.items():
         if domain in link_host:
-            # Garde-fou T2 sur domain override aussi
-            if theme == T2 and not _t2_passes_guards():
+            # Gardes-fou (T1/T2) appliquees aussi sur le domain override
+            if not _guard_ok(theme):
                 continue
             return theme
 
@@ -1941,12 +2155,27 @@ def _assign_media_theme(row):
     # (ex: AgriMaroc -> T1, ONSSA -> T1, AMMC -> T5)
     forced = MEDIA_SCOUT_FORCED_SOURCE_THEMES.get(website_name)
     if forced:
-        # Garde-fou T2 : meme une source force-T2 verifie especes + focus geo.
-        if forced == T2 and not _t2_passes_guards():
+        # Gardes-fou (T1/T2) : meme une source forcee verifie sa garde.
+        if not _guard_ok(forced):
             return "Autres"
         return forced
 
     return "Autres"
+
+
+# Feeds d'intelligence concurrentielle "purpose-built" (topic-scopes laitier/
+# epicerie) : leurs articles sont forces en Veille Concurrentielle (sinon les
+# articles sans mot-cle business explicite — nutrition, packaging — tomberaient
+# en Informative, alors qu'ils relevent de la veille concurrentielle T3).
+_FORCE_CONCURRENTIELLE_SOURCES = {
+    # T3 — Produits laitiers & Épicerie fine
+    "GNews — Presse éco MA", "GNews — Lait International", "GNews — FMCG Retail",
+    "GNews — Nutrition Santé", "GNews — Nouveautés Premium",
+    # T1 — Agrumes, Fruits rouges & Tomates cerises
+    "GNews — Agrumes Export MA", "GNews — Marché Agrumes Intl",
+    "GNews — Marché Fruits Rouges", "GNews — Concurrents Primeurs",
+    "GNews — Production Fruits MA", "GNews — Innovations Fruits",
+}
 
 
 def _assign_media_veille(row):
@@ -1956,6 +2185,10 @@ def _assign_media_veille(row):
     Veilles n'est suffisant. Reglementaire > Concurrentielle > Evenementielle
     en cas d'egalite de score (les regulations priment sur les annonces business).
     """
+    # Sources d'intelligence concurrentielle dediees -> forcees Concurrentielle
+    if str(row.get("Website_name", "")).strip() in _FORCE_CONCURRENTIELLE_SOURCES:
+        return "Veille Concurrentielle"
+
     title_text = _fold_media_text(row.get("Title", ""))
     body_text = _fold_media_text(" ".join([
         str(row.get("Description", "")),
@@ -2037,7 +2270,7 @@ except Exception:
 # Bumper cette version a chaque modification de la taxonomie (themes, keywords, sources).
 # Inclus dans le slot de cache -> invalide automatiquement le DataFrame en cache et
 # force un re-scraping a la prochaine execution.
-_TAXONOMY_VERSION = "v25"
+_TAXONOMY_VERSION = "v31"
 
 
 def current_cache_slot() -> str:
@@ -2194,10 +2427,6 @@ _LLM_PROVIDERS = (
 # secret_name -> datetime jusqu'auquel la cle est marquee comme epuisee
 _LLM_EXHAUSTED = {}
 
-# Retro-compat : ancien nom encore utilise par certains call sites
-_GROQ_EXHAUSTED = _LLM_EXHAUSTED
-_GROQ_KEY_NAMES = ("GROQ_API_KEY", "GROQ_API_KEY_1")
-
 
 def _get_secret_or_env(name: str):
     """Recupere une valeur depuis st.secrets en priorite, sinon os.environ."""
@@ -2208,22 +2437,6 @@ def _get_secret_or_env(name: str):
     except Exception:
         pass
     return os.getenv(name)
-
-
-def _get_groq_api_keys() -> list:
-    """Liste des cles API Groq disponibles (retro-compat)."""
-    keys = []
-    for name in _GROQ_KEY_NAMES:
-        v = _get_secret_or_env(name)
-        if v and v not in keys:
-            keys.append(v)
-    return keys
-
-
-def _get_groq_api_key():
-    """Retro-compat : retourne la premiere cle Groq disponible (ou None)."""
-    keys = _get_groq_api_keys()
-    return keys[0] if keys else None
 
 
 def _get_available_llm_providers() -> list:
@@ -2669,6 +2882,30 @@ def _force_french_translate(text: str, kind: str = "phrase") -> str:
     return text
 
 
+@st.cache_data(ttl=43200, show_spinner=False)
+def translate_titles_to_french(titles: tuple) -> tuple:
+    """Traduit en francais une petite liste de titres (saute ceux deja FR).
+
+    Utilisee par le fallback d'affichage des cadres (liste de titres bruts) afin
+    de GARANTIR le francais meme si la synthese LLM n'a pas pu s'executer et si
+    la traduction au scraping a ete limitee (rate limit free tier).
+
+    Cache par contenu (TTL 12h) -> chaque titre n'est traduit qu'une fois puis
+    reutilise sur tous les reruns (auto-correction au fil des interactions).
+    Fail-safe : retourne les titres originaux si aucune cle LLM ou echec.
+    """
+    if not _has_any_llm_key():
+        return titles
+    out = []
+    for t in titles:
+        t = str(t)
+        if t and not _looks_french(t):
+            out.append(_force_french_translate(t, kind="titre"))
+        else:
+            out.append(t)
+    return tuple(out)
+
+
 # Taille de lot pour la traduction batchee des articles (token budget)
 _TRANSLATE_CHUNK_SIZE = 12
 
@@ -2794,7 +3031,7 @@ def compute_signal_du_jour(articles_context: tuple) -> dict:
         "CSRD, BRC, etc.). JAMAIS de phrase en anglais.\n\n"
         "Tu es analyste de veille pour LES DOMAINES AGRICOLES (LDA), groupe agro-industriel "
         "marocain integrant : agrumes, fruits rouges, maraichage, elevage (ovin/bovin/caprin/"
-        "volaille), produits laitiers, epicerie fine, exports UE/Afrique/Moyen-Orient. "
+        "volaille/aquaculture), produits laitiers, epicerie fine, exports UE/Afrique/Moyen-Orient. "
         "Standards QSE : GlobalGAP, IFS, BRC, FSSC 22000, ISO 14001/22000/26000/45001, Codex, "
         "ONSSA, Halal/Bio.\n\n"
         "Articles captures :\n\n"
@@ -3079,7 +3316,7 @@ def compute_veille_summary(articles_context: tuple, veille_label: str) -> dict:
 
     prompt = (
         "Tu es analyste de veille pour LES DOMAINES AGRICOLES, groupe agro-industriel marocain : "
-        "production vegetale (agrumes, fruits rouges, maraichage), elevage ovin/bovin/caprin/volaille, "
+        "production vegetale (agrumes, fruits rouges, maraichage), elevage ovin/bovin/caprin/volaille/aquaculture, "
         "produits laitiers, epicerie fine, exports UE/Afrique/Moyen-Orient. "
         "Standards QSE applicables : GlobalGAP, IFS Food, BRCGS, FSSC 22000, ISO 9001/14001/22000/26000/45001, "
         "Codex Alimentarius, ONSSA, IMANOR, certifications Halal/Bio.\n\n"

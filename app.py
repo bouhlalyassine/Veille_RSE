@@ -4,6 +4,7 @@
 
 
 import re
+import unicodedata
 from datetime import date, timedelta
 from html import escape
 from io import BytesIO
@@ -28,6 +29,7 @@ from Settings import (
     get_source_origin,
     load_css,
     media_scrape_timestamp,
+    translate_titles_to_french,
 )
 
 
@@ -46,7 +48,7 @@ load_css()
 # data_media_scout est l'unique source : decoree @st.cache_data(ttl=36000),
 # on l'appelle ici pour peupler le cache au demarrage. Tous les appels suivants
 # (rendu du tableau de bord Veille) hit le cache en quelques millisecondes.
-with st.spinner("Recherche d'actualités en cours sur l'ensemble des sources (première ouverture du jour : quelques minutes)..."):
+with st.spinner("Recherche d'actualités en cours sur l'ensemble des sources (2 mises à jour paramétrées : 7h00 et 19h00) — quelques minutes…"):
     _slot = current_cache_slot()
     data_media_scout(MEDIA_SCOUT_URLS, slot=_slot)
     # Fige l'horodatage de cette collecte (meme slot -> meme valeur jusqu'au prochain creneau)
@@ -104,8 +106,8 @@ def _veille_display(veille: str) -> str:
 
 def _theme_display(theme: str) -> str:
     return {
-        "Agrumes, Fruits rouges & Maraichage":           "🍊 Agrumes, Fruits rouges & Maraîchage",
-        "Elevage (Ovins, Bovins, Caprins, Volailles)":   "🐄 Élevage (Ovins, Bovins, Caprins, Volailles)",
+        "Agrumes, Fruits rouges & Maraichage":           "🍊 Agrumes, Fruits rouges & Tomates cerises",
+        "Elevage (Ovins, Bovins, Caprins, Volailles)":   "🐄 Élevage (Ovins, Bovins, Caprins, Volailles & Aquaculture)",
         "Produits laitiers & Epicerie fine":             "🧀 Produits laitiers & Épicerie fine",
         "Environnement, Eau & Energie":                  "🌍 Environnement, Eau & Énergie",
         "ESG, QSE & SST":                                "🏛️ Normes : ESG, QSE & SST",
@@ -343,6 +345,23 @@ div[data-testid="stAppViewContainer"] main .block-container{
     font-size:14px !important;
     font-weight:700 !important;
     color:var(--ink) !important;
+}
+/* Filtres "categorie" + "type de produit" (dialog Concurrentielle) : placeholder
+   plus sombre, identique a celui de "Choisir un theme" (var(--ink)) */
+.st-key-con_ptype_filter [data-baseweb="select"] [data-baseweb="placeholder"],
+.st-key-con_ptype_filter [data-baseweb="placeholder"],
+.st-key-con_pcat_filter [data-baseweb="select"] [data-baseweb="placeholder"],
+.st-key-con_pcat_filter [data-baseweb="placeholder"]{
+    color:var(--ink) !important;
+    -webkit-text-fill-color:var(--ink) !important;
+    opacity:1 !important;
+    font-weight:700 !important;
+}
+.st-key-con_ptype_filter [data-baseweb="select"] input::placeholder,
+.st-key-con_pcat_filter [data-baseweb="select"] input::placeholder{
+    color:var(--ink) !important;
+    -webkit-text-fill-color:var(--ink) !important;
+    opacity:1 !important;
 }
 .st-key-filter-row [data-baseweb="tag"]{
     font-size:13.5px !important;
@@ -1622,8 +1641,8 @@ def _events_in_window(start_date, end_date, themes=None):
     return sorted(events, key=lambda item: item["date"])
 
 
-def _future_events_for_themes(start_date, themes, months=6):
-    """Evenements a venir dans les 6 mois a partir de start_date, filtres par themes."""
+def _future_events_for_themes(start_date, themes, months=12):
+    """Evenements a venir dans les 12 mois a partir de start_date, filtres par themes."""
     end_date = start_date + timedelta(days=30 * months)
     return _events_in_window(start_date, end_date, themes=themes)
 
@@ -1711,11 +1730,6 @@ def _show_veille_details(veille, group, selected_themes, calendar_events=None):
     emoji = MEDIA_SCOUT_VEILLE_EMOJI.get(veille, "")
     st.markdown(f"### {emoji} {_veille_display(veille)}")
 
-    article_count = len(group)
-    extra_count = len(calendar_events) if calendar_events else 0
-    total = article_count + extra_count
-    st.caption(f"{total} article(s) sur la période et le thème sélectionné.")
-
     if calendar_events:
         st.markdown(
             '<div class="scout-theme-divider">📅 Calendrier ESG/RSE & journées thématiques</div>',
@@ -1737,6 +1751,88 @@ def _show_veille_details(veille, group, selected_themes, calendar_events=None):
             st.info("Aucun article classé dans cette veille sur la période et le thème sélectionné.")
         return
 
+    # ── Veille Concurrentielle : tag « type de produit » + filtre dédié ──
+    is_con = (veille == "Veille Concurrentielle")
+    if is_con:
+        _con_t = _con_theme(selected_themes)
+        group = group.copy()
+        group["_ptype"] = group.apply(lambda r: _detect_product_type(r, _con_t), axis=1)
+        group["_pcat"] = group.apply(lambda r: _detect_category(r, _con_t), axis=1)
+
+        # Diversité totale (décide quels filtres afficher)
+        _all_cats = set(group["_pcat"])
+        _all_prods = set(group["_ptype"])
+
+        # Sélections courantes (lues AVANT rendu des widgets) -> filtres LIÉS :
+        # les options de chaque filtre dépendent de la sélection de l'autre.
+        # On purge d'abord toute sélection devenue invalide (ex: changement de
+        # thème — les catégories/types diffèrent d'un profil concurrentiel à
+        # l'autre), sinon st.multiselect lèverait « value not in options ».
+        _cur_cat = [c for c in (st.session_state.get("con_pcat_filter") or []) if c in _all_cats]
+        _cur_prod = [t for t in (st.session_state.get("con_ptype_filter") or []) if t in _all_prods]
+        if _cur_cat != (st.session_state.get("con_pcat_filter") or []):
+            st.session_state["con_pcat_filter"] = _cur_cat
+        if _cur_prod != (st.session_state.get("con_ptype_filter") or []):
+            st.session_state["con_ptype_filter"] = _cur_prod
+        # Catégories dispo = celles présentes pour le(s) produit(s) sélectionné(s)
+        _sub_cat = group[group["_ptype"].isin(_cur_prod)] if _cur_prod else group
+        # Produits dispo = ceux présents pour la/les catégorie(s) sélectionnée(s)
+        _sub_prod = group[group["_pcat"].isin(_cur_cat)] if _cur_cat else group
+        # Union avec la sélection courante -> évite l'erreur "value not in options"
+        _cat_set = set(_sub_cat["_pcat"]) | set(_cur_cat)
+        _prod_set = set(_sub_prod["_ptype"]) | set(_cur_prod)
+        _prof = _CON_PROFILES.get(_con_t) or {}
+        _cat_order = _prof.get("categories", [])
+        _prod_order = _prof.get("product_order", [])
+        _present_cat = [c for c in _cat_order if c in _cat_set]
+        _present = [t for t in _prod_order if t in _prod_set]
+
+        # Filtres liés Catégorie + Type de produit. Les deux côte à côte si chacun
+        # a >1 valeur ; sinon le filtre unique est centré (même largeur qu'un duo).
+        _show_cat = len(_all_cats) > 1
+        _show_prod = len(_all_prods) > 1
+        _selc, _sel = [], []
+
+        def _f_cat(slot):
+            with slot:
+                return st.multiselect(
+                    label="", label_visibility="collapsed",
+                    options=_present_cat,
+                    placeholder="🗂️ Filtrer par catégorie",
+                    default=[],
+                    key="con_pcat_filter",
+                )
+
+        def _f_prod(slot):
+            with slot:
+                return st.multiselect(
+                    label="", label_visibility="collapsed",
+                    options=_present,
+                    placeholder="🏷️ Filtrer par type de produit",
+                    default=[],
+                    key="con_ptype_filter",
+                )
+
+        if _show_cat and _show_prod:
+            _, fcat, fprod, _ = st.columns([8, 42, 42, 8])
+            _selc = _f_cat(fcat)
+            _sel = _f_prod(fprod)
+        elif _show_cat or _show_prod:
+            # Filtre unique centré (mêmes proportions qu'un filtre du duo)
+            _, fone, _ = st.columns([29, 42, 29])
+            if _show_cat:
+                _selc = _f_cat(fone)
+            else:
+                _sel = _f_prod(fone)
+
+        if _selc:
+            group = group[group["_pcat"].isin(_selc)]
+        if _sel:
+            group = group[group["_ptype"].isin(_sel)]
+        if (_selc or _sel) and group.empty:
+            st.info("Aucun article concurrent pour la sélection.")
+            return
+
     for theme in selected_themes:
         theme_articles = group[group["Theme"] == theme]
         if theme_articles.empty:
@@ -1757,7 +1853,15 @@ def _show_veille_details(veille, group, selected_themes, calendar_events=None):
             link = str(row.get("Link", "")).strip()
 
             # Date + source en gras via markdown (st.expander supporte markdown depuis 1.26+)
-            header = f"📰  **{date_str}**  |  {title}  |  **{source}**"
+            # Pour la Veille Concurrentielle : tags « catégorie » + « type de produit ».
+            if is_con:
+                _cat = str(row.get("_pcat", "")).strip()
+                _typ = str(row.get("_ptype", "")).strip()
+                _tags = "  |  ".join(f"`{t}`" for t in (_cat, _typ) if t)
+                _tagpart = f"{_tags}  |  " if _tags else ""
+                header = f"📰  **{date_str}**  |  {_tagpart}{title}  |  **{source}**"
+            else:
+                header = f"📰  **{date_str}**  |  {title}  |  **{source}**"
             with st.expander(header):
                 if desc:
                     st.markdown(f'<div class="scout-expander-summary">{escape(desc)}</div>', unsafe_allow_html=True)
@@ -1770,19 +1874,19 @@ def _show_veille_details(veille, group, selected_themes, calendar_events=None):
                     )
 
 
-# ─── Dialog : Veille Evenementielle (calendrier 6 mois) ───────────────────────
+# ─── Dialog : Veille Evenementielle (calendrier 12 mois) ──────────────────────
 @st.dialog(" ", width="large")
 def _show_events_dialog(events, themes, start_date):
     st.markdown(f"### 📅 Veille Évènementielle")
-    end_d = start_date + timedelta(days=180)
+    end_d = start_date + timedelta(days=365)
     st.caption(
-        f"{len(events)} événement(s) à venir sur 6 mois "
+        f"{len(events)} événement(s) à venir sur 12 mois "
         f"({_format_date_fr(start_date)} → {_format_date_fr(end_d)}) "
         f"· filtré sur le thème sélectionné."
     )
 
     if not events:
-        st.info("Aucun événement à venir sur le thème sélectionné dans les 6 prochains mois.")
+        st.info("Aucun événement à venir sur le thème sélectionné dans les 12 prochains mois.")
         return
 
     # Regroupement par mois pour une lecture chronologique
@@ -1821,38 +1925,6 @@ def _show_events_dialog(events, themes, start_date):
     )
 
 
-# ─── Helpers : entries HTML for cadre body ────────────────────────────────────
-def _cadre_entries_html(rows, tone: str, max_n: int = 4) -> str:
-    if rows.empty:
-        return '<div class="cadre-list"><div class="empty-state">Aucun signal sur cette veille pour la période sélectionnée.</div></div>'
-    items_html = ['<div class="cadre-list">']
-    # Tri : Zone Maroc > EU > World, puis Date desc (priorisation locale du contenu)
-    rows_sorted = rows.copy()
-    rows_sorted["_zone_prio"] = rows_sorted["Website_name"].astype(str).map(_zone_priority)
-    rows_sorted = rows_sorted.sort_values(["_zone_prio", "Date"], ascending=[True, False])
-    for idx, row in enumerate(rows_sorted.head(max_n).iterrows()):
-        _, r = row
-        title = escape(str(r.get("Title", "")).strip())
-        source = escape(str(r.get("Website_name", "")).strip())
-        zone = _zone_label(str(r.get("Website_name", "")))
-        link = escape(str(r.get("Link", "")).strip(), quote=True)
-        date_short = escape(_format_date_short(r.get("Date")))
-
-        # Truncate title to keep cadre compact
-        title_display = title if len(title) <= 140 else title[:137] + "…"
-        zone_html = f'<b class="zone-tag">{zone}</b> — ' if zone else ""
-        src_link = f'<a class="src-num" href="{link}" target="_blank" rel="noopener" title="{source} · {date_short}">{idx+1}</a>' if link else ""
-
-        items_html.append(
-            '<div class="entry">'
-            '<span class="b"></span>'
-            f'<span class="txt">{zone_html}{title_display} {src_link}</span>'
-            '</div>'
-        )
-    items_html.append('</div>')
-    return "".join(items_html)
-
-
 def _cadre_synthesis_html(rows, veille_key: str, themes: list) -> str:
     """Synthese LLM des articles d'une veille : 3-5 puces orientees KPI/chiffres/idees.
 
@@ -1887,11 +1959,16 @@ def _cadre_synthesis_html(rows, veille_key: str, themes: list) -> str:
     bullets = summary.get("bullets", []) if summary.get("available") else []
 
     if not bullets:
-        # Fallback : pseudo-puces format [Zone : Titre] (la synthese LLM a echoue)
-        # Meme apparence visuelle que les bullets pour preserver l'harmonie
+        # Fallback : pseudo-puces format [Zone : Titre] (la synthese LLM a echoue).
+        # On TRADUIT les titres en francais (cache) pour garantir le francais meme
+        # ici (sources EN : Food Navigator, EFSA...). Meme apparence que les bullets.
+        fb_rows = list(rows_sorted.head(5).iterrows())
+        fb_titles_fr = translate_titles_to_french(
+            tuple(str(r.get("Title", "")).strip() for _, r in fb_rows)
+        )
         fallback_items = []
-        for i, (_, r) in enumerate(rows_sorted.head(5).iterrows()):
-            title = escape(str(r.get("Title", "")).strip())
+        for (_, r), title_fr in zip(fb_rows, fb_titles_fr):
+            title = escape(str(title_fr).strip())
             if len(title) > 180:
                 title = title[:177] + "…"
             zone = _zone_label(str(r.get("Website_name", "")))
@@ -1936,17 +2013,38 @@ def _cadre_head_html(tone: str, title: str, count: int) -> str:
 # Sans @st.fragment, un clic sur un bouton declenche un rerun complet du script
 # (re-rendu de tout le layout + filterbar + sources). Avec fragment, seule cette
 # portion ré-exécute → suppression du freeze percu apres clic.
-# Liste explicite des concurrents LDA en laitier / epicerie fine.
-# Un article doit (1) provenir d'un site concurrent OU (2) mentionner au moins UN
-# de ces termes pour apparaitre dans Veille Concurrentielle T3.
-_LDA_COMPETITORS = (
+def _fold_txt(text: str) -> str:
+    """Minuscule + sans accents + apostrophes normalisées (pour matching robuste)."""
+    t = unicodedata.normalize("NFKD", str(text).lower())
+    t = "".join(c for c in t if not unicodedata.combining(c))
+    return t.replace("’", "'").replace("`", "'")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  VEILLE CONCURRENTIELLE — profils par thème
+#  Chaque thème éligible définit son profil : catégories d'intelligence, mapping
+#  source -> catégorie, marques concurrentes (gate de pertinence), sites
+#  corporates, marques LDA suivies, et règles de type de produit (tag + filtre).
+#  Un article apparaît en Concurrentielle s'il provient d'un site concurrent, OU
+#  mentionne un concurrent / une marque LDA, OU porte sur un produit identifiable.
+# ════════════════════════════════════════════════════════════════════════════
+
+# ─────────────────────────── T3 : Produits laitiers & Épicerie fine ──────────
+_CAT_MARCHE_LOCAL  = "MARCHÉ LOCAL"
+_CAT_INTL          = "INTERNATIONAL"
+_CAT_FMCG          = "FMCG / RETAIL"
+_CAT_NUTRITION     = "NUTRITION / SANTÉ"
+_CAT_NOUVEAUTES    = "NOUVEAUTÉS"
+
+_DAIRY_COMPETITORS = (
     # Produits laitiers
     "danone", "copag", "jaouda", "safilait", "jibal", "groupe bel",
-    "vache qui rit", "lavachequirit", "kiri", "president fromage", "lactel",
-    "lactalis", "savencia", "nestle maroc", "nido",
+    "vache qui rit", "lavachequirit", "kiri", "babybel", "president fromage",
+    "lactel", "lactalis", "galbani", "savencia", "caprice des dieux",
+    "saint albray", "elle & vire", "nestle maroc", "nido",
     # Distributeurs MDD (laitier + epicerie)
-    "label vie", "labelvie", "marjane gourmet", "marjane mdd",
-    "carrefour selection", "carrefour maroc", "bim maroc",
+    "label vie", "labelvie", "marjane", "carrefour selection",
+    "carrefour maroc", "bim maroc",
     # Epicerie fine
     "aicha", "aïcha", "lesieur cristal", "lesieur ", "zouitina",
     "diana holding", "caracterre", "cartier saada", "sovena",
@@ -1954,44 +2052,183 @@ _LDA_COMPETITORS = (
     "andros", "st dalfour", "st. dalfour", "hero group", "hero confiture",
     "beldimarket",
 )
+_DAIRY_BRAND_SITES = {"Aïcha", "Nestlé MENA", "Groupe Bel", "Ribambel (Bel)"}
+_DAIRY_OWN_BRANDS = ("chergui", "domaines agricoles", "les domaines agricoles", "jaouda")
+_DAIRY_SOURCE_CATEGORY = {
+    # C1 — Marché local & Maghreb
+    "GNews — Presse éco MA": _CAT_MARCHE_LOCAL, "La Vie Éco": _CAT_MARCHE_LOCAL,
+    "Le Matin": _CAT_MARCHE_LOCAL, "EcoActu": _CAT_MARCHE_LOCAL,
+    "Aujourd'hui Maroc": _CAT_MARCHE_LOCAL,
+    "GNews — Centrale Danone": _CAT_MARCHE_LOCAL, "GNews — COPAG Jaouda": _CAT_MARCHE_LOCAL,
+    "GNews — Lesieur Cristal": _CAT_MARCHE_LOCAL,
+    "GNews — Marjane Maroc": _CAT_MARCHE_LOCAL, "GNews — Olive MA": _CAT_MARCHE_LOCAL,
+    "Aïcha": _CAT_MARCHE_LOCAL,
+    # C2 — Secteur laitier international
+    "GNews — Lait International": _CAT_INTL, "DairyReporter": _CAT_INTL,
+    "Food Navigator": _CAT_INTL, "Financial Afrik": _CAT_INTL,
+    "GNews — Lactalis": _CAT_INTL, "GNews — Savencia": _CAT_INTL,
+    "GNews — Bel Maroc": _CAT_INTL, "Groupe Bel": _CAT_INTL, "Ribambel (Bel)": _CAT_INTL,
+    "Nestlé MENA": _CAT_INTL, "GNews — Bonne Maman Andros": _CAT_INTL,
+    "GNews — Hero St Dalfour": _CAT_INTL, "GNews — Sovena Puget": _CAT_INTL,
+    # C3 — FMCG / Retail / Distribution
+    "GNews — FMCG Retail": _CAT_FMCG,
+    # C4 — Nutrition fonctionnelle & Santé
+    "GNews — Nutrition Santé": _CAT_NUTRITION,
+    # C5 — Nouveautés produits & Premium
+    "GNews — Nouveautés Premium": _CAT_NOUVEAUTES,
+}
+_DAIRY_PRODUCT_RULES = [
+    ("FROMAGE",     ["fromage", "fromagerie", "cheese", "vache qui rit", "kiri", "babybel",
+                     "caprice des dieux", "saint albray", "raclette", "camembert", "emmental",
+                     "cancoillotte", "feta", "mozzarella", "cheddar", "gouda"]),
+    ("YAOURT",      ["yaourt", "yogurt", "yogourt", "activia", "skyr", "danette",
+                     "creme dessert", "lait fermente", "petit suisse"]),
+    ("BEURRE/CREME",["beurre", "creme fraiche", "creme legere", " creme ", "butter", " cream"]),
+    ("LAIT",        ["lait uht", "lait en poudre", "lait infantile", "lait demi", "lait ecreme",
+                     "lait entier", "lait cru", "lait pasteurise", " lait ", "milk", "nido",
+                     "poudre de lait", "collecte de lait", "filiere laitiere"]),
+    ("HUILE",       ["huile d'olive", "huile de tournesol", "huile de table", "huile vegetale",
+                     "huile alimentaire", "huile", "olive oil", "oleicole", "lesieur",
+                     "trituration"]),
+    ("CONFITURE",   ["confiture", "marmelade", "gelee", "pate a tartiner", "tartiner", "jam"]),
+    ("CONSERVE",    ["conserve", "concentre de tomate", "double concentre", "triple concentre",
+                     "tomate", "sardine", "thon", "anchois", "harissa", "cornichon",
+                     "olive", "olives", "cartier saada"]),
+    ("BOISSON",     ["jus de fruit", "jus d'orange", " jus ", "boisson", "nectar", "smoothie", "soda"]),
+    ("MIEL",        ["miel", "honey"]),
+    ("EPICES/CONDIMENTS", ["epice", "condiment", "sauce", "vinaigre", "moutarde", "mayonnaise", "ketchup"]),
+    ("CEREALES",    ["cereale", "farine", "couscous", "semoule", "pates alimentaires", " riz ", "biscuit"]),
+]
 
-# Noms des sources concurrents (= valeurs Website_name du DataFrame)
-# Tout article provenant d'un de ces sites est automatiquement considere
-# comme article concurrent, meme s'il ne mentionne pas explicitement la marque
-# dans son titre/description.
-_LDA_COMPETITOR_SOURCES = {
-    # Sites corporates HTML (presse)
-    "Aïcha", "Lesieur Cristal",
-    "Nestlé MENA", "Groupe Bel", "Ribambel (Bel)",
-    # Google News RSS aggregators (chaque feed cible 1 marque/cluster precis)
-    "GNews — Centrale Danone",
-    "GNews — COPAG Jaouda",
-    "GNews — Lesieur Cristal",
-    "GNews — Marjane Maroc",
-    "GNews — Bel Maroc",
-    "GNews — Lactalis",
-    "GNews — Savencia",
-    "GNews — Bonne Maman Andros",
-    "GNews — Hero St Dalfour",
-    "GNews — Olive MA",
-    "GNews — Sovena Puget",
-    # NOTE : EcoActu / Aujourd'hui Maroc / Challenge.ma / Financial Afrik ne
-    # sont PAS dans ce set -> ils ne comptent comme concurrent QUE si un
-    # article mentionne explicitement une marque LDA (_LDA_COMPETITORS).
+# ─────────────────── T1 : Agrumes, Fruits rouges & Tomates cerises ───────────
+_ACAT_MARCHE      = "MARCHÉ MAROC"
+_ACAT_EXPORT      = "EXPORT & MARCHÉS"
+_ACAT_CONCURRENTS = "CONCURRENTS"
+_ACAT_FILIERE     = "FILIÈRE & PRODUCTION"
+_ACAT_PREMIUM     = "VARIÉTÉS & PREMIUM"
+
+_AGRUMES_COMPETITORS = (
+    # Exportateurs concurrents (primeurs / agrumes / fruits rouges)
+    "azura", "delassus", "duroc", "maraissa", "disma international", "disma",
+    "zalar", "rosaflor", "agrumar", "surexport", "driscoll", "soprofel",
+    # Organismes filière / export — actus sectorielles pertinentes
+    "morocco foodex", "maroc foodex", "eacce", "aspam", "maroc citrus", "apefel",
+)
+_AGRUMES_OWN_BRANDS = ("les domaines agricoles", "domaines agricoles")
+_AGRUMES_SOURCE_CATEGORY = {
+    # A1 — Marché Maroc
+    "GNews — Agrumes Export MA": _ACAT_MARCHE, "EcoActu": _ACAT_MARCHE,
+    "Aujourd'hui Maroc": _ACAT_MARCHE,
+    # A2 — Export & marchés internationaux
+    "GNews — Marché Agrumes Intl": _ACAT_EXPORT, "GNews — Marché Fruits Rouges": _ACAT_EXPORT,
+    "FreshPlaza FR": _ACAT_EXPORT, "Agro-media": _ACAT_EXPORT, "FruitNet": _ACAT_EXPORT,
+    "FreshFruitPortal": _ACAT_EXPORT, "Financial Afrik": _ACAT_EXPORT,
+    # A3 — Concurrents
+    "GNews — Concurrents Primeurs": _ACAT_CONCURRENTS,
+    # A4 — Filière & production
+    "GNews — Production Fruits MA": _ACAT_FILIERE,
+    # A5 — Variétés & premium
+    "GNews — Innovations Fruits": _ACAT_PREMIUM,
+}
+_AGRUMES_PRODUCT_RULES = [
+    ("AGRUMES",       ["agrume", "agrumes", "orange", "oranges", "mandarine", "clementine",
+                       "citron", "pamplemousse", "pomelo", "lime", "kumquat", "bergamote",
+                       "citrus", "navel", "valencia", "nadorcott", "afourer", "maroc late",
+                       "soft citrus"]),
+    ("TOMATE CERISE", ["tomate cerise", "tomates cerises", "cherry tomato", "cherry tomatoes",
+                       "tomate cocktail", "tomate grappe"]),
+    ("FRAISE",        ["fraise", "fraises", "strawberry"]),
+    ("FRAMBOISE",     ["framboise", "framboises", "raspberry"]),
+    ("MYRTILLE",      ["myrtille", "myrtilles", "blueberry"]),
+    ("FRUITS ROUGES", ["fruits rouges", "fruit rouge", "mure", "mures", "cassis", "groseille",
+                       "groseilles", "blackberry", "cranberry", "berries", "berry",
+                       "petits fruits", "soft fruit"]),
+    ("TOMATE",        ["tomate", "tomates", "tomato"]),
+]
+
+# Registre des profils (clé = thème interne).
+_CON_PROFILES = {
+    "Produits laitiers & Epicerie fine": {
+        "categories": [_CAT_MARCHE_LOCAL, _CAT_INTL, _CAT_FMCG, _CAT_NUTRITION, _CAT_NOUVEAUTES],
+        "source_category": _DAIRY_SOURCE_CATEGORY,
+        "competitors": _DAIRY_COMPETITORS,
+        "brand_sites": _DAIRY_BRAND_SITES,
+        "own_brands": _DAIRY_OWN_BRANDS,
+        "product_rules": _DAIRY_PRODUCT_RULES,
+    },
+    "Agrumes, Fruits rouges & Maraichage": {
+        "categories": [_ACAT_MARCHE, _ACAT_EXPORT, _ACAT_CONCURRENTS, _ACAT_FILIERE, _ACAT_PREMIUM],
+        "source_category": _AGRUMES_SOURCE_CATEGORY,
+        "competitors": _AGRUMES_COMPETITORS,
+        "brand_sites": set(),
+        "own_brands": _AGRUMES_OWN_BRANDS,
+        "product_rules": _AGRUMES_PRODUCT_RULES,
+    },
 }
 
+# Pré-calcul au chargement : ordre des types + mots-clés foldés (1× par profil).
+for _prof in _CON_PROFILES.values():
+    _prof["product_order"] = [tag for tag, _ in _prof["product_rules"]] + ["AUTRE"]
+    _prof["product_rules_folded"] = [
+        (tag, [_fold_txt(kw) for kw in kws]) for tag, kws in _prof["product_rules"]
+    ]
 
-def _article_mentions_competitor(row) -> bool:
-    """True si l'article vient d'un site concurrent OU mentionne explicitement
-    un concurrent LDA dans son titre/description.
+
+def _con_theme(selected_themes):
+    """Thème concurrentiel actif (le thème sélectionné s'il a un profil), sinon None."""
+    if selected_themes:
+        t = selected_themes[0]
+        if t in _CON_PROFILES:
+            return t
+    return None
+
+
+def _detect_category(row, theme) -> str:
+    """Catégorie d'intelligence concurrentielle d'un article (selon sa source)."""
+    prof = _CON_PROFILES.get(theme)
+    if not prof:
+        return ""
+    return prof["source_category"].get(
+        str(row.get("Website_name", "")).strip(), prof["categories"][0]
+    )
+
+
+def _detect_product_type(row, theme) -> str:
+    """Retourne un tag de type de produit (selon le profil du thème) ou 'AUTRE'."""
+    prof = _CON_PROFILES.get(theme)
+    if not prof:
+        return "AUTRE"
+    text = " " + _fold_txt(str(row.get("Title", "")) + " " + str(row.get("Description", ""))) + " "
+    for tag, keywords in prof["product_rules_folded"]:
+        for kw in keywords:
+            if kw in text:
+                return tag
+    return "AUTRE"
+
+
+def _article_mentions_competitor(row, theme) -> bool:
+    """Garde l'article seulement s'il est PERTINENT pour les activités LDA du
+    thème — sinon écarte le bruit des sources d'intelligence générales.
+
+    Pertinent si :
+      1. provient d'un site corporate concurrent, OU
+      2. mentionne une marque concurrente / une marque LDA suivie, OU
+      3. porte sur un produit identifiable du thème (type ≠ AUTRE).
     """
-    # 1. Article venant directement d'un site concurrent ?
+    prof = _CON_PROFILES.get(theme)
+    if not prof:
+        return False
     source = str(row.get("Website_name", "")).strip()
-    if source in _LDA_COMPETITOR_SOURCES:
+    if source in prof["brand_sites"]:
         return True
-    # 2. Sinon : check mention explicite d'une marque concurrente
     text = (str(row.get("Title", "")) + " " + str(row.get("Description", ""))).lower()
-    return any(c in text for c in _LDA_COMPETITORS)
+    if any(c in text for c in prof["competitors"]):
+        return True
+    if any(b in text for b in prof["own_brands"]):
+        return True
+    if _detect_product_type(row, theme) != "AUTRE":
+        return True
+    return False
 
 
 @st.fragment
@@ -2000,14 +2237,16 @@ def _render_veille_dashboard(filtered_df, selected_themes, upcoming_events, star
     selected_veille = st.session_state.get("scout_selected_veille")
     n_events = len(upcoming_events)
 
-    # Veille Concurrentielle : active UNIQUEMENT pour le theme "Produits laitiers & Epicerie fine"
-    # ET requiert mention explicite d'au moins un concurrent LDA dans le titre/description
-    is_t3_dairy = bool(selected_themes) and "Produits laitiers" in selected_themes[0]
-    if is_t3_dairy:
+    # Veille Concurrentielle : active pour les themes dotes d'un profil concurrentiel
+    # (Produits laitiers & Epicerie fine ; Agrumes, Fruits rouges & Tomates cerises) ET
+    # requiert une mention concurrent / marque LDA / produit identifiable dans l'article.
+    con_theme = _con_theme(selected_themes)
+    is_con_theme = con_theme is not None
+    if is_con_theme:
         con_candidates = filtered_df[filtered_df["Veille"] == "Veille Concurrentielle"]
-        # Filtre strict : on ne garde que les articles mentionnant un concurrent LDA
+        # Filtre strict : on ne garde que les articles pertinents pour le thème
         if not con_candidates.empty:
-            mask = con_candidates.apply(_article_mentions_competitor, axis=1)
+            mask = con_candidates.apply(lambda r: _article_mentions_competitor(r, con_theme), axis=1)
             con_group = con_candidates[mask]
         else:
             con_group = con_candidates
@@ -2017,10 +2256,9 @@ def _render_veille_dashboard(filtered_df, selected_themes, upcoming_events, star
         n_con = 0
 
     # Layout conditionnel :
-    #   - Theme T3 laitier  -> 3 colonnes [Concurrentielle | Signal | Evenementielle]
-    #   - Autre theme       -> 2 colonnes [Signal (etendu) | Evenementielle]
-    #   La Veille Concurrentielle n'a de sens que pour T3 (laitier+epicerie).
-    if is_t3_dairy:
+    #   - Theme avec profil concurrentiel -> 3 colonnes [Concurrentielle | Signal | Evenementielle]
+    #   - Autre theme                     -> 2 colonnes [Signal (etendu) | Evenementielle]
+    if is_con_theme:
         sig_cols = st.columns([1.2, 4, 1.2], gap="medium", vertical_alignment="top")
         con_slot = sig_cols[0]
         signal_slot = sig_cols[1]
@@ -2071,7 +2309,7 @@ def _render_veille_dashboard(filtered_df, selected_themes, upcoming_events, star
             evt_label,
             key="open_events_btn",
             disabled=(n_events == 0),
-            help="Voir le calendrier des événements à venir sur 6 mois",
+            help="Voir le calendrier des événements à venir sur 12 mois",
         ):
             st.session_state["scout_show_events"] = True
 
@@ -2105,9 +2343,9 @@ def _render_veille_dashboard(filtered_df, selected_themes, upcoming_events, star
     # ── Dialog handler : detail d'une veille (Reg / Inf / Con) ──
     if selected_veille in ("Veille Reglementaire", "Veille Informative", "Veille Concurrentielle"):
         selected_group = filtered_df[filtered_df["Veille"] == selected_veille]
-        # Pour Concurrentielle : filtre strict sur mention de concurrent LDA
-        if selected_veille == "Veille Concurrentielle" and not selected_group.empty:
-            mask = selected_group.apply(_article_mentions_competitor, axis=1)
+        # Pour Concurrentielle : filtre strict de pertinence selon le profil du thème
+        if selected_veille == "Veille Concurrentielle" and not selected_group.empty and con_theme:
+            mask = selected_group.apply(lambda r: _article_mentions_competitor(r, con_theme), axis=1)
             selected_group = selected_group[mask]
         _show_veille_details(selected_veille, selected_group, selected_themes, None)
         st.session_state.pop("scout_selected_veille", None)
@@ -2582,7 +2820,7 @@ if st.session_state.get("scout_view", "veille") == "veille":
     if issues:
         # Landing visuel : grands boutons (1 par thème) avec dégradé de couleur
         # dédié + emoji en filigrane. Au clic, le thème est pré-sélectionné et le
-        # tableau de bord s'affiche. Disposition : 3 en haut, 2 centrés en bas.
+        # tableau de bord s'affiche. Disposition : 2 centrés en haut, 3 en bas.
         # Espace haut (br) masqué en mobile via .st-key-landing-top-spacer (CSS).
         with st.container(key="landing-top-spacer"):
             st.markdown("<br>", unsafe_allow_html=True)
@@ -2616,19 +2854,19 @@ if st.session_state.get("scout_view", "veille") == "veille":
             )
 
         _themes = MEDIA_SCOUT_THEMES
-        # Ligne 1 : 3 boutons
-        _row1 = st.columns(3, gap="medium")
-        for _j in range(min(3, len(_themes))):
-            with _row1[_j]:
+        # Ligne 1 : 2 boutons centrés (largeur identique à la ligne du bas via spacers)
+        _row1 = st.columns([1, 2, 2, 1], gap="medium")
+        _slots1 = [_row1[1], _row1[2]]
+        for _j in range(min(2, len(_themes))):
+            with _slots1[_j]:
                 _render_theme_btn(_themes[_j], _j)
-        # Ligne 2 : les 2 restants, centrés (largeur identique grâce aux spacers)
-        _rest = _themes[3:]
+        # Ligne 2 : les 3 restants
+        _rest = _themes[2:]
         if _rest:
-            _row2 = st.columns([1, 2, 2, 1], gap="medium")
-            _slots = [_row2[1], _row2[2]]
-            for _k, _theme in enumerate(_rest[:2]):
-                with _slots[_k]:
-                    _render_theme_btn(_theme, 3 + _k)
+            _row2 = st.columns(3, gap="medium")
+            for _k, _theme in enumerate(_rest[:3]):
+                with _row2[_k]:
+                    _render_theme_btn(_theme, 2 + _k)
     else:
         with st.spinner("Synthèse des signaux..."):
             media_data_df = data_media_scout(MEDIA_SCOUT_URLS, slot=current_cache_slot())
@@ -2641,12 +2879,31 @@ if st.session_state.get("scout_view", "veille") == "veille":
 
         # Veille Evenementielle : evenements a venir 6 mois a partir de start_date,
         # filtres par les themes selectionnes (catalogue statique journees + salons + congres)
-        upcoming_events = _future_events_for_themes(start_date, selected_themes, months=6)
+        upcoming_events = _future_events_for_themes(start_date, selected_themes, months=12)
 
         if filtered_df.empty and not upcoming_events:
             st.info("Aucune actualité pertinente trouvée sur la période et les thèmes sélectionnés.")
         else:
             # ── SIGNAL DU JOUR ────────────────────────────────────────────────
+            # Pool de candidats. Pour les thèmes à profil concurrentiel (T1/T3),
+            # on garantit la présence de la Veille Concurrentielle (pertinente,
+            # filtrée) aux côtés du Réglementaire / Informatif — sinon elle est
+            # écrasée par le volume des autres veilles et ne pèse jamais.
+            _sig_con_theme = _con_theme(selected_themes)
+            if _sig_con_theme:
+                _pool_parts = []
+                for _v in ("Veille Reglementaire", "Veille Informative", "Veille Concurrentielle"):
+                    _vsub = filtered_df[filtered_df["Veille"] == _v]
+                    if _v == "Veille Concurrentielle" and not _vsub.empty:
+                        _vsub = _vsub[_vsub.apply(
+                            lambda r: _article_mentions_competitor(r, _sig_con_theme), axis=1
+                        )]
+                    _pool_parts.append(_vsub.sort_values("Date", ascending=False).head(8))
+                _signal_pool = pd.concat(_pool_parts)
+                if _signal_pool.empty:
+                    _signal_pool = filtered_df.head(25)
+            else:
+                _signal_pool = filtered_df.head(25)
             signal_articles = tuple(
                 " | ".join(
                     part for part in [
@@ -2660,9 +2917,9 @@ if st.session_state.get("scout_view", "veille") == "veille":
                     ]
                     if part and not part.endswith(": ")
                 )
-                for _, row in filtered_df.head(25).iterrows()
+                for _, row in _signal_pool.iterrows()
             )
-            with st.spinner("Identification du signal du jour..."):
+            with st.spinner("Analyse des actualités et identification du signal du jour…"):
                 signal = compute_signal_du_jour(signal_articles)
 
             _signal_tooltip = (
@@ -2736,7 +2993,7 @@ else:
   <ul>
     <li>Aggrégation d'actualités <b>Maroc · UE · monde</b>, organisées en 4 cadres de veille : <b>Réglementaire</b>, <b>Informative</b>, <b>Évènementielle</b>, <b>Concurrentielle</b>.</li>
     <li>Un <b>Signal du jour</b> : article à fort impact potentiel pour Les Domaines Agricoles.</li>
-    <li><i>Thèmes couverts : Agrumes, Fruits rouges &amp; Maraîchage · Élevage (Ovins, Bovins, Caprins, Volailles) · Produits laitiers &amp; Épicerie fine · Environnement, Eau &amp; Énergie · ESG, QSE &amp; SST.</i></li>
+    <li><i>Thèmes couverts : Agrumes, Fruits rouges &amp; Tomates cerises · Produits laitiers &amp; Épicerie fine · Élevage (Ovins, Bovins, Caprins, Volailles &amp; Aquaculture) · Environnement, Eau &amp; Énergie · Normes : ESG, QSE &amp; SST.</i></li>
   </ul>
 </div>
 """,
@@ -2759,6 +3016,12 @@ else:
         )
 
     df_urls = pd.DataFrame(MEDIA_SCOUT_SOURCE_CATALOG)
+    # Retire les codes internes d'organisation (C1, A2, T4…) en tête de "Couverture"
+    # — utiles côté maintenance mais déroutants pour l'utilisateur final.
+    df_urls["Couverture"] = (
+        df_urls["Couverture"].astype(str)
+        .str.replace(r"^[A-Z]\d+\s*[—–\-:]?\s*", "", regex=True)
+    )
     df_urls["Origine"] = df_urls["Journal"].map(get_source_origin)
     df_urls["Thème"] = df_urls["Journal"].map(MEDIA_SCOUT_FORCED_SOURCE_THEMES).map(_theme_display).fillna("Multi-thèmes")
     df_urls["Zone"] = df_urls["Journal"].map(MEDIA_SCOUT_SOURCE_ZONES).fillna("—")
