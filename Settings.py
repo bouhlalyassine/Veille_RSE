@@ -1214,6 +1214,25 @@ def _clean_media_text(value):
     return re.sub(r"\s+", " ", text).strip()
 
 
+# Pied-de-page de flux RSS WordPress -> bruit a retirer des resumes/descriptions.
+# Ex: "The post <titre> appeared first on <site>." / "L'article ... est apparu en
+# premier sur ...". Coupe a partir du marqueur jusqu'a la fin.
+_RSS_FOOTER_RE = re.compile(
+    r"\s*(?:the post\b.*?appeared first on\b"
+    r"|l['’]article\b.*?est apparu en premier sur\b"
+    r"|cet article\b.*?(?:provient|est issu) de\b"
+    r"|read more\b.*$|lire la suite\b.*$).*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _strip_rss_artifacts(value):
+    """Retire les pieds-de-page de flux RSS (WordPress) des descriptions."""
+    if not value:
+        return value
+    return _RSS_FOOTER_RE.sub("", value).strip()
+
+
 def _fold_media_text(value):
     text = _clean_media_text(value).lower()
     text = unicodedata.normalize("NFKD", text)
@@ -1298,7 +1317,7 @@ _JUNK_TITLES = frozenset({
 
 def _article_record(source_url, title, description, link, date_value):
     title = _clean_media_text(title)
-    description = _clean_media_text(description)
+    description = _strip_rss_artifacts(_clean_media_text(description))
     link = urljoin(source_url, _clean_media_text(link))
     date_text = _normalize_media_date(date_value) or _date_from_url(link)
     if not title or len(title) < 8 or not link or not date_text:
@@ -2072,6 +2091,47 @@ def _t3_is_off_target(text_folded: str) -> bool:
     return False
 
 
+# ── Garde-fou T4 : Environnement, Eau & Énergie -> Maroc OU portee mondiale ──
+# Un article T4 centre sur un pays/region etranger (ex. Braskem / Ameriques,
+# "China's emissions", "UK's carbon budget"...) SANS dimension Maroc ni portee
+# globale (mondial, COP, GIEC, ONU, UE...) est demote. On garde : le Maroc, les
+# sujets mondiaux/UE, et les sujets sans focus pays. Matching par mot entier
+# (gere les possessifs anglais "china's", evite "chinatown").
+_T4_MAROC_MARKERS = (
+    "maroc", "morocco", "marocain", "marocaine", "maghreb", "afrique du nord",
+    "rabat", "casablanca", "tanger", "marrakech", "agadir",
+)
+_T4_GLOBAL_MARKERS = (
+    "mondial", "mondiale", "mondiaux", "monde", "planete", "planetaire",
+    "cop28", "cop29", "cop30", "cop 28", "cop 29", "cop 30", "giec", "ipcc",
+    "accord de paris", "nations unies", "onu", "banque mondiale", "fmi", "oms",
+    "mediterranee", "mediterraneen",
+    # UE / Europe : reglementation impactant les exports Maroc -> pertinent
+    "union europeenne", "ue", "europe", "europeen", "europeenne", "bruxelles",
+)
+# Pays/regions etrangers : marqueurs nettoyes (sans espace) -> match mot entier.
+_T4_FOREIGN_MARKERS = tuple(sorted(
+    {m.strip() for m in _FILTER_OTHER_COUNTRY_MARKERS}
+    | {"ameriques", "amerique latine", "amerique du nord", "amerique du sud",
+       "amazonie", "amazon", "californie", "texas", "royaume-uni", "uk",
+       "angleterre", "britannique", "british", "londres", "allemagne",
+       "allemand", "espagne", "espagnol", "italie", "italien"}
+))
+
+
+def _t4_is_off_scope(text_folded: str) -> bool:
+    """True si un article T4 doit etre demote : focus pays/region etranger (hors
+    Maroc) SANS dimension Maroc ni portee globale/UE. Voir commentaire ci-dessus.
+    """
+    if any(_keyword_in_media_text(text_folded, m) for m in _T4_MAROC_MARKERS):
+        return False
+    if any(_keyword_in_media_text(text_folded, m) for m in _T4_GLOBAL_MARKERS):
+        return False
+    if any(_keyword_in_media_text(text_folded, m) for m in _T4_FOREIGN_MARKERS):
+        return True
+    return False
+
+
 def _assign_media_theme(row):
     """Classification par mots-cles avec fallbacks defensifs.
 
@@ -2105,6 +2165,7 @@ def _assign_media_theme(row):
     T2 = "Elevage (Ovins, Bovins, Caprins, Volailles)"
     T1 = "Agrumes, Fruits rouges & Maraichage"
     T3 = "Produits laitiers & Epicerie fine"
+    T4 = "Environnement, Eau & Energie"
 
     # Helper : verifie qu'un candidat T2 passe les 2 gardes (especes + geo)
     def _t2_passes_guards():
@@ -2115,7 +2176,7 @@ def _assign_media_theme(row):
         return True
 
     # Garde-fou par theme : T1 recentre (cultures cibles), T2 betail,
-    # T3 produits laitiers/epicerie (hors equipement/techno). Defaut : OK.
+    # T3 produits laitiers/epicerie (hors equipement/techno), T4 Maroc/mondial.
     def _guard_ok(theme):
         if theme == T2:
             return _t2_passes_guards()
@@ -2123,7 +2184,20 @@ def _assign_media_theme(row):
             return not _t1_is_off_target(guard_text)
         if theme == T3:
             return not _t3_is_off_target(guard_text)
+        if theme == T4:
+            return not _t4_is_off_scope(guard_text)
         return True
+
+    # Une demotion GEOGRAPHIQUE (hors perimetre Maroc/monde) -> "Autres" sans
+    # reroutage : un article etranger hors-scope ne doit pas atterrir dans un
+    # autre theme (ex. Braskem/Ameriques ne doit pas glisser de T4 vers T3).
+    # Une demotion de CONTENU (mauvais theme) autorise le reroutage.
+    def _is_geo_demotion(theme):
+        if theme == T4:
+            return True  # seul motif de demote T4 = hors-scope geo
+        if theme == T2:  # T2 geo = espece presente mais focus pays etranger
+            return _has_livestock_species(title_text, body_text) and _t2_is_foreign_focused(title_text)
+        return False     # T1 / T3 = gardes de contenu -> reroutage permis
 
     if candidates:
         sorted_candidates = sorted(
@@ -2132,10 +2206,10 @@ def _assign_media_theme(row):
             reverse=True,
         )
         best = sorted_candidates[0][0]
-        # Garde-fou : si le meilleur candidat echoue sa garde (T1 hors cible OU
-        # T2 sans espece/focus etranger), reroute vers le prochain candidat qui
-        # passe la sienne, sinon "Autres".
         if not _guard_ok(best):
+            # Hors-scope geographique -> Autres ; sinon (contenu) -> reroutage.
+            if _is_geo_demotion(best):
+                return "Autres"
             for cand, _ in sorted_candidates[1:]:
                 if _guard_ok(cand):
                     return cand
@@ -2270,7 +2344,7 @@ except Exception:
 # Bumper cette version a chaque modification de la taxonomie (themes, keywords, sources).
 # Inclus dans le slot de cache -> invalide automatiquement le DataFrame en cache et
 # force un re-scraping a la prochaine execution.
-_TAXONOMY_VERSION = "v31"
+_TAXONOMY_VERSION = "v33"
 
 
 def current_cache_slot() -> str:
@@ -2350,13 +2424,14 @@ def data_media_scout(urls=None, slot: str = ""):
     df["Date"] = pd.to_datetime(df["Date"], format="%d/%m/%Y", errors="coerce")
     df = df.dropna(subset=["Date", "Title", "Link"])
     # Filtre pre-classification : exclure offres emploi, auto, sante pure, ONCF, non-Maroc
-    df = df[~df.apply(_should_exclude_article, axis=1)]
+    # .copy() -> df autonome (evite SettingWithCopyWarning sur les ecritures de colonnes).
+    df = df[~df.apply(_should_exclude_article, axis=1)].copy()
     if df.empty:
         empty_df = pd.DataFrame(columns=columns)
         empty_df["Date"] = pd.to_datetime(empty_df["Date"])
         return empty_df
     df["Theme"] = df.apply(_assign_media_theme, axis=1)
-    df = df[df["Theme"].isin(MEDIA_SCOUT_THEMES)]
+    df = df[df["Theme"].isin(MEDIA_SCOUT_THEMES)].copy()
 
     if df.empty:
         empty_df = pd.DataFrame(columns=columns)
@@ -2375,10 +2450,9 @@ def data_media_scout(urls=None, slot: str = ""):
 
     df["Veille"] = df.apply(_assign_media_veille, axis=1)
 
-    # Filtres post-classification :
-    # 1) Pertinence Maroc (direct ou impact potentiel via EU/WORLD)
-    # 2) Pour le theme IA, garde uniquement les news "WAW" (modeles, decouvertes), drop infra
-    df = df[df.apply(_should_keep_article, axis=1)]
+    # Filtre post-classification : pertinence Maroc (zone MAROC, marqueur Maroc
+    # direct, ou portee large UE/mondiale) -> ecarte les news purement etrangeres.
+    df = df[df.apply(_should_keep_article, axis=1)].copy()
 
     if df.empty:
         empty_df = pd.DataFrame(columns=columns)
@@ -2770,7 +2844,7 @@ def _llm_validate_themes(df):
                 if df_idx not in valid_df_indices:
                     keep_mask[df_idx] = False
 
-    return df[keep_mask]
+    return df[keep_mask].copy()
 
 
 # ─── Application des outputs LLM en francais ────────────────────────────────
@@ -3068,70 +3142,43 @@ def compute_signal_du_jour(articles_context: tuple) -> dict:
                 fields[key.strip().lower()] = val.strip()
         return fields
 
-    def _translate_to_french(headline_raw: str, summary_raw: str) -> tuple:
-        """Tente une traduction LLM courte vers le francais.
-        Si echec, retourne (headline_raw, summary_raw) inchanges.
-        """
-        if not headline_raw and not summary_raw:
-            return ("", "")
-        try:
-            trans_prompt = (
-                "Traduis le titre et le resume ci-dessous EN FRANCAIS CORRECT. "
-                "Si deja en francais, reformule legerement pour lisibilite. "
-                "Reponds en JSON strict : "
-                '{"titre_fr":"<titre francais court 10-14 mots>",'
-                '"resume_fr":"<resume francais 2-3 phrases, 40-60 mots>"}\n\n'
-                f"Titre: {headline_raw[:280]}\n"
-                f"Resume: {summary_raw[:600]}"
-            )
-            resp = _groq_chat_with_failover(
-                messages=[
-                    {"role": "system", "content": "Tu es un traducteur professionnel anglais->francais. Tu rends UNIQUEMENT du francais correct, sans anglais."},
-                    {"role": "user", "content": trans_prompt},
-                ],
-                model="llama-3.3-70b-versatile",
-                max_tokens=300,
-                temperature=0.3,
-            )
-            txt = resp.choices[0].message.content.strip()
-            if txt.startswith("```"):
-                txt = re.sub(r"^```(?:json)?\s*", "", txt)
-                txt = re.sub(r"\s*```$", "", txt)
-            mm = re.search(r"\{[\s\S]*\}", txt)
-            if mm:
-                txt = mm.group(0)
-            data = json.loads(txt)
-            return (
-                str(data.get("titre_fr", "")).strip() or headline_raw,
-                str(data.get("resume_fr", "")).strip() or summary_raw,
-            )
-        except Exception:
-            return (headline_raw, summary_raw)
-
     def _build_fallback_signal():
+        """Signal de repli (LLM principal en echec) avec FRANCAIS GARANTI :
+        titre via le traducteur cache + garde-fou _looks_french, et a defaut une
+        formulation francaise generique. Aucun texte anglais brut n'est affiche.
+        """
         if not articles_context:
             return {"available": False}
         first = articles_context[0]
         fields = _parse_article_fields(first)
         headline_raw = fields.get("titre", "")
-        resume_raw = fields.get("resume", "")
+        resume_raw = _strip_rss_artifacts(fields.get("resume", ""))
         source = fields.get("source", "")
         theme = fields.get("theme", "")
         veille_short = fields.get("veille", "Informative").replace("Veille ", "")
 
-        # Traduction defensive vers le francais (cas article EN)
-        headline_fr, resume_fr = _translate_to_french(headline_raw, resume_raw)
-        headline_fr = headline_fr[:160] if headline_fr else f"Signal issu de {source}"
+        # Titre : traducteur cache fiable -> garde-fou -> sinon titre generique FR.
+        headline_fr = ""
+        if headline_raw:
+            headline_fr = (translate_titles_to_french((headline_raw,))[0] or "").strip()
+            if not _looks_french(headline_fr):
+                headline_fr = _force_french_translate(headline_fr, kind="titre")
+        if not headline_fr or not _looks_french(headline_fr):
+            headline_fr = f"Signal de veille — {source}" if source else "Signal de veille du jour"
+        headline_fr = headline_fr[:160]
 
-        # Body en francais : resume traduit OU phrase generique francaise
-        if resume_fr:
-            words = resume_fr.split()
-            body = " ".join(words[:70]) + ("..." if len(words) > 70 else "")
-        else:
-            body = (
-                f"Article identifie via {source} sur le perimetre {theme}. "
-                "Sujet a surveiller pour ses implications potentielles sur les activites "
-                "du groupe (production, transformation, exports ou conformite)."
+        # Corps : resume traduit en FR ; si toujours pas francais -> phrase generique FR.
+        body = ""
+        if resume_raw:
+            body_fr = _force_french_translate(resume_raw, kind="phrase")
+            if _looks_french(body_fr):
+                words = body_fr.split()
+                body = " ".join(words[:70]) + ("…" if len(words) > 70 else "")
+        if not body:
+            ctx = f"Article identifié via {source} sur le périmètre {theme}. " if (source or theme) else ""
+            body = ctx + (
+                "Sujet à surveiller pour ses implications potentielles sur les activités "
+                "du groupe (production, transformation, exports ou conformité)."
             )
 
         return {
@@ -3199,206 +3246,3 @@ def compute_signal_du_jour(articles_context: tuple) -> dict:
     except Exception:
         # En cas d'erreur LLM (timeout, JSON parse, network, etc.) : fallback heuristique
         return _build_fallback_signal()
-
-
-# Mapping pour normaliser les prefixes de puces vers MA / EU / WW
-_BULLET_PREFIX_MAP = {
-    # MA - Maroc / Maghreb / Afrique du Nord
-    "maroc": "MA", "morocco": "MA", "marocain": "MA", "marocaine": "MA",
-    "maghreb": "MA", "afrique du nord": "MA", "north africa": "MA", "ma": "MA",
-    "onssa": "MA", "imanor": "MA", "ministere": "MA", "agrimaroc": "MA",
-    # EU - Europe / pays europeens / institutions UE
-    "ue": "EU", "eu": "EU", "europe": "EU", "europeen": "EU", "european": "EU",
-    "union europeenne": "EU", "commission europeenne": "EU", "commission": "EU",
-    "france": "EU", "francais": "EU", "francaise": "EU", "french": "EU",
-    "royaume-uni": "EU", "royaume uni": "EU", "uk": "EU", "british": "EU", "britannique": "EU",
-    "allemagne": "EU", "germany": "EU", "german": "EU",
-    "espagne": "EU", "spain": "EU", "spanish": "EU",
-    "italie": "EU", "italy": "EU", "italian": "EU",
-    "pays-bas": "EU", "netherlands": "EU", "dutch": "EU",
-    "belgique": "EU", "belgium": "EU",
-    "efsa": "EU", "efrag": "EU", "esma": "EU", "afnor": "EU", "novethic": "EU",
-    "dg sante": "EU", "eu-osha": "EU", "emas": "EU",
-    "ecovadis": "EU", "actu-environnement": "EU", "carenews": "EU",
-    # WW - International / Mondial / Onusien
-    "ww": "WW", "international": "WW", "mondial": "WW", "monde": "WW", "world": "WW",
-    "global": "WW", "globale": "WW", "non-profit": "WW",
-    "fao": "WW", "oms": "WW", "who": "WW", "oit": "WW", "ilo": "WW", "onu": "WW", "un": "WW",
-    "iso": "WW", "ocde": "WW", "oecd": "WW", "iea": "WW", "irena": "WW", "unep": "WW",
-    "usa": "WW", "etats-unis": "WW", "us": "WW", "americain": "WW", "american": "WW",
-    "fda": "WW", "usda": "WW", "osha us": "WW", "wri": "WW",
-    "codex": "WW", "woah": "WW", "oie": "WW", "globalgap": "WW", "global gap": "WW",
-    "poultry world": "WW", "dairyreporter": "WW",
-    "ifs": "WW", "brcgs": "WW", "brc": "WW", "fssc": "WW", "sedex": "WW", "smeta": "WW",
-    "fairtrade": "WW", "fsc": "WW", "gri": "WW", "ifrs": "WW", "sasb": "WW", "issb": "WW",
-    "tnfd": "WW", "sbti": "WW", "cdp": "WW", "ghg protocol": "WW", "ghgprotocol": "WW",
-    "pri": "WW", "responsible investor": "WW", "esg today": "WW", "esg investor": "WW",
-    "environmental finance": "WW", "climate home news": "WW", "carbon brief": "WW",
-    "ellen macarthur": "WW", "ellenmacarthur": "WW", "basel": "WW",
-    "energy voice": "WW", "just food": "WW", "food navigator": "WW",
-}
-
-
-def _normalize_bullet_prefix(bullet: str) -> str:
-    """Reecrit le prefixe d'une puce vers MA / EU / WW si necessaire.
-
-    Si la puce commence deja par 'MA :', 'EU :' ou 'WW :', la garde telle quelle.
-    Sinon, tente de remapper le prefixe (avant le premier ' : ') via _BULLET_PREFIX_MAP.
-    En dernier recours, garde la puce inchangee (fallback safe).
-    """
-    if not bullet:
-        return bullet
-    # Deja conforme : MA : / EU : / WW : (case insensitive en debut)
-    m = re.match(r"^\s*(MA|EU|WW)\s*:\s*(.+)", bullet, re.IGNORECASE)
-    if m:
-        return f"{m.group(1).upper()} : {m.group(2).strip()}"
-    # Cherche un prefixe au format "<libelle> : <reste>"
-    m = re.match(r"^\s*([^:]{1,40}?)\s*:\s*(.+)", bullet)
-    if not m:
-        return bullet
-    raw_prefix = m.group(1).strip().lower()
-    rest = m.group(2).strip()
-    # Lookup direct
-    if raw_prefix in _BULLET_PREFIX_MAP:
-        return f"{_BULLET_PREFIX_MAP[raw_prefix]} : {rest}"
-    # Lookup partiel : check si un keyword est contenu dans le prefixe
-    for key, zone in _BULLET_PREFIX_MAP.items():
-        if key in raw_prefix:
-            return f"{zone} : {rest}"
-    # Fallback : pas de match -> WW (international par defaut, neutre)
-    return f"WW : {rest}"
-
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def compute_veille_summary(articles_context: tuple, veille_label: str) -> dict:
-    """Synthese KPI/chiffres/idees globales pour un cadre Veille (Reg / Inf).
-
-    Format uniforme pour les 2 veilles :
-      - 5 a 7 puces (4-6 pour Informative, 5-7 pour Reglementaire)
-      - Max 26 mots par puce
-      - Style telegraphique factuel, chiffres en chiffres + unites courtes
-
-    Args:
-        articles_context: tuple de chaines (Titre|Source|Date|Theme|Resume)
-        veille_label: nom de la veille (ex: "Veille Reglementaire")
-
-    Returns:
-        {
-          'bullets': list[str]
-          'available': bool
-        }
-    """
-    if not articles_context:
-        return {"bullets": [], "available": False}
-
-    if not _has_any_llm_key():
-        return {"bullets": [], "available": False}
-
-    articles_text = "\n".join(f"- {a}" for a in articles_context[:30])
-
-    is_reg = "reglementaire" in veille_label.lower() or "réglementaire" in veille_label.lower()
-
-    # Angle d'analyse selon la veille (format de sortie identique - format harmonise)
-    if is_reg:
-        veille_focus = (
-            "Angle d'analyse : nouveautes REGLEMENTAIRES (textes officiels, normes, sanctions, "
-            "echeances de conformite, seuils techniques imposes)."
-        )
-    else:
-        veille_focus = (
-            "Angle d'analyse : tendances INFORMATIVES de fond (chiffres marche, evolutions filiere, "
-            "innovations, contexte geopolitique/climat impactant le secteur)."
-        )
-
-    n_articles = len(articles_context)
-    # Nombre de puces = nombre d'articles plafonne a 5 (1 article -> 1 puce, 3 -> 3 puces, 5+ -> 5)
-    target_bullets = min(n_articles, 5)
-
-    prompt = (
-        "Tu es analyste de veille pour LES DOMAINES AGRICOLES, groupe agro-industriel marocain : "
-        "production vegetale (agrumes, fruits rouges, maraichage), elevage ovin/bovin/caprin/volaille/aquaculture, "
-        "produits laitiers, epicerie fine, exports UE/Afrique/Moyen-Orient. "
-        "Standards QSE applicables : GlobalGAP, IFS Food, BRCGS, FSSC 22000, ISO 9001/14001/22000/26000/45001, "
-        "Codex Alimentarius, ONSSA, IMANOR, certifications Halal/Bio.\n\n"
-        "LANGUE DE SORTIE : OBLIGATOIREMENT FRANCAIS. "
-        "Toutes les puces doivent etre redigees en francais correct, meme si les articles fournis "
-        "sont en anglais (traduis et reformule en francais).\n\n"
-        f"Cadre a analyser : {veille_label}\n"
-        f"{veille_focus}\n\n"
-        f"Voici les {n_articles} article(s) effectivement captures sur la periode et le theme selectionne :\n\n"
-        f"{articles_text}\n\n"
-        "REGLE FONDAMENTALE - ANCRE STRICTE DANS LE CORPUS :\n"
-        "  - Chaque puce DOIT etre tiree EXCLUSIVEMENT du contenu des articles fournis ci-dessus.\n"
-        "  - INTERDIT d'inventer des chiffres, organismes, dates, evenements absents des articles.\n"
-        "  - INTERDIT d'ajouter des 'tendances generales sectorielles' qui ne sont pas dans le corpus.\n"
-        "  - Si un article ne mentionne pas de chiffre, ne fabrique PAS de chiffre : restitue le fait qualitatif.\n\n"
-        f"Genere EXACTEMENT {target_bullets} puce(s) (1 puce par article ou groupe d'articles thematiquement lie). "
-        f"Plafonne a 5 si plus de 5 articles, mais ne descend pas en dessous de {target_bullets}.\n\n"
-        "STRUCTURE OBLIGATOIRE de chaque puce (format strictement uniforme) :\n"
-        "  [PREFIXE] : [Fait factuel tire de l'article avec chiffre si present]. [Implication concise pour la filiere].\n\n"
-        "PREFIXES AUTORISES (UN SEUL de ces trois codes, EXACTEMENT, suivi de ' : ') :\n"
-        "  - « MA : » pour Maroc / Afrique du Nord / Maghreb / sources gouvernementales marocaines (ONSSA, IMANOR, ministeres, AgriMaroc, EcoActu, FNH, CGEM, Medias24, MAP, Le Vert...)\n"
-        "  - « EU : » pour Union Europeenne ET pays europeens (incluant Royaume-Uni, France, Allemagne, Espagne...) + institutions UE (Commission, EFSA, DG SANTE, EFRAG, ESMA, AFNOR, Novethic, Actu-Environnement...)\n"
-        "  - « WW : » pour international / mondial / ONU-FAO-OMS-OIT / ISO / normes mondiales / autres regions (USA, Asie, Afrique sub-saharienne, Moyen-Orient...)\n\n"
-        "REGLE STRICTE : utiliser UNIQUEMENT « MA : », « EU : » ou « WW : » comme prefixe. "
-        "JAMAIS d'autre format (« Royaume-Uni : », « France : », « Bio&Me : », « FeedNavigator : » INTERDITS).\n\n"
-        "Exemples du format attendu :\n"
-        "  - « EU : Reglement 2024/1234 impose un seuil residus pesticides a 0.01 mg/kg pour les agrumes des le 1er janvier 2026. Conformite requise pour exports. »\n"
-        "  - « EU : Bio&Me capitalise sur la tendance croissante de la sante intestinale et de la consommation de fibres. Signal de positionnement pour epicerie fine. »\n"
-        "  - « MA : ONSSA renforce les controles a l'import avec 12 nouveaux laboratoires accredites. Delais de dedouanement reduits a 48h. »\n"
-        "  - « WW : FAO note une hausse de 8 pct des prix mondiaux des produits laitiers en Q3 2024. Pression sur les marges aval. »\n\n"
-        "Regles formelles UNIFORMES :\n"
-        "  - Toujours commencer EXACTEMENT par « MA : », « EU : » ou « WW : »\n"
-        "  - 28 mots MAXIMUM par puce, 15 mots minimum\n"
-        "  - Chiffres en chiffres + unite courte (%, M$, MAD, EUR, t, MW, jours...) UNIQUEMENT si presents dans l'article\n"
-        "  - Pas de jargon journalistique ('selon', 'a indique', 'precise que')\n"
-        "  - Pas de titre d'article cite verbatim\n"
-        "  - Pas de double-quote DANS les puces\n"
-        "  - Chaque puce porte sur un sujet distinct (zero doublon)\n\n"
-        f"Reponds STRICTEMENT au format JSON (rien d'autre, pas de markdown). Le tableau bullets contient {target_bullets} element(s) :\n"
-        '{"bullets":["<puce>", ...]}'
-    )
-    try:
-        response = _groq_chat_with_failover(
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Tu es analyste de veille pour LES DOMAINES AGRICOLES. "
-                        "REGLE ABSOLUE : toutes les puces produites DOIVENT etre en "
-                        "francais correct, JAMAIS en anglais ni dans une autre langue. "
-                        "Meme si les articles sources sont en anglais, tu TRADUIS et "
-                        "REFORMULES en francais. Acronymes anglais autorises (ISO, RSE, "
-                        "GHG, CSRD, BRC). Aucune phrase complete en anglais."
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-            model="llama-3.3-70b-versatile",
-            max_tokens=600,
-            temperature=0.25,
-        )
-        raw = response.choices[0].message.content.strip()
-        if raw.startswith("```"):
-            raw = re.sub(r"^```(?:json)?\s*", "", raw)
-            raw = re.sub(r"\s*```$", "", raw)
-        m = re.search(r"\{[\s\S]*\}", raw)
-        if m:
-            raw = m.group(0)
-        parsed = json.loads(raw)
-        bullets = parsed.get("bullets", [])
-        # Nettoyage : strings non vides, cap au nombre d'articles disponibles (max 5)
-        # Permet 1 article -> 1 puce, 3 articles -> 3 puces, 5+ articles -> 5 puces
-        bullets = [str(b).strip() for b in bullets if str(b).strip()][:target_bullets]
-        # Normalisation des prefixes : remplace les prefixes non-conformes par MA/EU/WW
-        bullets = [_normalize_bullet_prefix(b) for b in bullets]
-        # GARDE-FOU LANGUE : chaque puce doit etre en francais (sinon retraduction)
-        bullets = [
-            b if _looks_french(b) else _force_french_translate(b, kind="puce")
-            for b in bullets
-        ]
-        # Re-normalise les prefixes apres traduction (au cas ou)
-        bullets = [_normalize_bullet_prefix(b) for b in bullets]
-        return {"bullets": bullets, "available": bool(bullets)}
-    except Exception:
-        return {"bullets": [], "available": False}

@@ -3,7 +3,6 @@
 #  git add .    # git commit -m "Màj"   # git push -u origin master
 
 
-import re
 import unicodedata
 from datetime import date, timedelta
 from html import escape
@@ -22,7 +21,6 @@ from Settings import (
     MEDIA_SCOUT_FORCED_SOURCE_THEMES,
     MEDIA_SCOUT_SOURCE_ZONES,
     compute_signal_du_jour,
-    compute_veille_summary,
     current_cache_slot,
     data_media_scout,
     format_last_update,
@@ -1926,10 +1924,12 @@ def _show_events_dialog(events, themes, start_date):
 
 
 def _cadre_synthesis_html(rows, veille_key: str, themes: list) -> str:
-    """Synthese LLM des articles d'une veille : 3-5 puces orientees KPI/chiffres/idees.
+    """Liste compacte des titres du TOP 5 d'une veille (tri zone Maroc > UE >
+    Monde, puis date), au format « ZONE : Titre » SANS la source.
 
-    Cache automatique via @st.cache_data sur compute_veille_summary (cle: tuple d'articles + label).
-    Fallback simple si pas de cle API ou erreur LLM : liste compacte des titres.
+    Les titres sont garantis en français (traduits via cache si la source est en
+    anglais). Remplace l'ancienne synthèse LLM, source de phrases incomplètes /
+    incohérentes (« WW : d'énergie propre. (14 words) », etc.).
     """
     if rows.empty:
         return (
@@ -1938,61 +1938,28 @@ def _cadre_synthesis_html(rows, veille_key: str, themes: list) -> str:
             '</div></div>'
         )
 
-    # Tri Maroc > EU > World puis date desc, prendre top 25 pour LLM (token budget)
+    # Tri Maroc > UE > Monde puis date desc, on garde les 5 premiers titres.
     rows_sorted = rows.copy()
     rows_sorted["_zone_prio"] = rows_sorted["Website_name"].astype(str).map(_zone_priority)
-    rows_sorted = rows_sorted.sort_values(["_zone_prio", "Date"], ascending=[True, False]).head(25)
+    rows_sorted = rows_sorted.sort_values(["_zone_prio", "Date"], ascending=[True, False]).head(5)
+    top_rows = list(rows_sorted.iterrows())
 
-    # Construction du contexte (immutable tuple pour le cache)
-    context_items = []
-    for _, r in rows_sorted.iterrows():
-        title = str(r.get("Title", "")).strip()
-        source = str(r.get("Website_name", "")).strip()
-        date_fr = _format_date_fr(r.get("Date"))
-        theme = _theme_display(str(r.get("Theme", "")).strip())
-        desc = str(r.get("Description", "")).strip()[:280]  # cap pour limiter tokens
-        line = f"Titre: {title} | Source: {source} | Date: {date_fr} | Theme: {theme} | Resume: {desc}"
-        context_items.append(line)
-    articles_context = tuple(context_items)
-
-    summary = compute_veille_summary(articles_context, _veille_display(veille_key))
-    bullets = summary.get("bullets", []) if summary.get("available") else []
-
-    if not bullets:
-        # Fallback : pseudo-puces format [Zone : Titre] (la synthese LLM a echoue).
-        # On TRADUIT les titres en francais (cache) pour garantir le francais meme
-        # ici (sources EN : Food Navigator, EFSA...). Meme apparence que les bullets.
-        fb_rows = list(rows_sorted.head(5).iterrows())
-        fb_titles_fr = translate_titles_to_french(
-            tuple(str(r.get("Title", "")).strip() for _, r in fb_rows)
-        )
-        fallback_items = []
-        for (_, r), title_fr in zip(fb_rows, fb_titles_fr):
-            title = escape(str(title_fr).strip())
-            if len(title) > 180:
-                title = title[:177] + "…"
-            zone = _zone_label(str(r.get("Website_name", "")))
-            zone_prefix = f"<b>{zone}</b> : " if zone else ""
-            fallback_items.append(
-                f'<div class="entry"><span class="b"></span>'
-                f'<span class="txt">{zone_prefix}{title}</span></div>'
-            )
-        return '<div class="cadre-list cadre-list-synthesis">' + "".join(fallback_items) + '</div>'
-
-    # Rendu en bullets avec prefixe MA / EU / WW en gras
-    def _bold_prefix(text: str) -> str:
-        safe = escape(text)
-        m = re.match(r"^(MA|EU|WW)\s*:\s*(.+)", safe, re.IGNORECASE)
-        if m:
-            return f'<b>{m.group(1).upper()} :</b> {m.group(2)}'
-        return safe
-
-    bullet_html = "".join(
-        f'<div class="entry"><span class="b"></span>'
-        f'<span class="txt">{_bold_prefix(b)}</span></div>'
-        for b in bullets
+    # Traduction FR des titres (cache) -> francais garanti meme pour sources EN.
+    titles_fr = translate_titles_to_french(
+        tuple(str(r.get("Title", "")).strip() for _, r in top_rows)
     )
-    return f'<div class="cadre-list cadre-list-synthesis">{bullet_html}</div>'
+    items = []
+    for (_, r), title_fr in zip(top_rows, titles_fr):
+        title = escape(str(title_fr).strip())
+        if len(title) > 180:
+            title = title[:177] + "…"
+        zone = _zone_label(str(r.get("Website_name", "")))
+        zone_prefix = f"<b>{zone}</b> : " if zone else ""
+        items.append(
+            f'<div class="entry"><span class="b"></span>'
+            f'<span class="txt">{zone_prefix}{title}</span></div>'
+        )
+    return '<div class="cadre-list cadre-list-synthesis">' + "".join(items) + '</div>'
 
 
 def _cadre_head_html(tone: str, title: str, count: int) -> str:
