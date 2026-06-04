@@ -2568,7 +2568,7 @@ st.markdown(
 
 # ─── FILTERBAR (période | thèmes | MàJ | À Propos/Veille DA | dark | freeze) ─
 with st.container(key="filter-row"):
-    fb_cols = st.columns([1.5, 5.0, 1.5, 1.2, 0.5, 0.5], gap="small", vertical_alignment="center")
+    fb_cols = st.columns([1.6, 5.0, 1.5, 1.2, 0.5, 0.5], gap="small", vertical_alignment="center")
 
     with fb_cols[0]:
         today = date.today()
