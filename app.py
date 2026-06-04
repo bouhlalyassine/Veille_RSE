@@ -1794,7 +1794,7 @@ def _show_veille_details(veille, group, selected_themes, calendar_events=None):
         def _f_cat(slot):
             with slot:
                 return st.multiselect(
-                    label="", label_visibility="collapsed",
+                    label="Filtrer par catégorie", label_visibility="collapsed",
                     options=_present_cat,
                     placeholder="🗂️ Filtrer par catégorie",
                     default=[],
@@ -1804,7 +1804,7 @@ def _show_veille_details(veille, group, selected_themes, calendar_events=None):
         def _f_prod(slot):
             with slot:
                 return st.multiselect(
-                    label="", label_visibility="collapsed",
+                    label="Filtrer par type de produit", label_visibility="collapsed",
                     options=_present,
                     placeholder="🏷️ Filtrer par type de produit",
                     default=[],
