@@ -71,6 +71,35 @@ def _format_date_fr(value):
     return date_str
 
 
+def _event_dates_for_year(event, year):
+    start_d = date(year, int(event["month"]), int(event["day"]))
+    end_month = int(event.get("end_month") or event["month"])
+    end_day = int(event.get("end_day") or event["day"])
+    end_d = date(year, end_month, end_day)
+    if end_d < start_d:
+        end_d = date(year + 1, end_month, end_day)
+    return start_d, end_d
+
+
+def _format_event_period(start_d, end_d=None):
+    if not end_d or end_d == start_d:
+        return _format_date_fr(start_d)
+    if start_d.month == end_d.month and start_d.year == end_d.year:
+        month_year = _format_date_fr(start_d).split(" ", 1)[1]
+        return f"{start_d.day:02d}-{end_d.day:02d} {month_year}"
+    if start_d.year == end_d.year:
+        start_no_year = _format_date_fr(start_d).rsplit(" ", 1)[0]
+        return f"{start_no_year}-{_format_date_fr(end_d)}"
+    return f"{_format_date_fr(start_d)}-{_format_date_fr(end_d)}"
+
+
+def _event_card_date_parts(start_d, end_d=None):
+    if end_d and end_d != start_d and start_d.month == end_d.month and start_d.year == end_d.year:
+        return f"{start_d.day:02d}-{end_d.day:02d}", _format_date_fr(start_d).split(" ", 1)[1]
+    date_fr = _format_date_fr(start_d)
+    return f"{start_d.day:02d}", date_fr.split(" ", 1)[1] if " " in date_fr else date_fr
+
+
 def _format_date_short(value):
     if pd.isna(value):
         return "—"
@@ -1229,6 +1258,9 @@ div[data-testid="stAppViewContainer"] main .block-container{
     line-height:1;
     color:var(--teal);
 }
+[data-testid="stDialog"] .event-card .event-day.event-day-range{
+    font-size:21px;
+}
 [data-testid="stDialog"] .event-card .event-month{
     font-family:"Inter", sans-serif;
     font-weight:600;
@@ -1569,7 +1601,7 @@ _EVENTS_CATALOG = [
     {"month": 5, "day": 12, "name": "IFAT Munich (environnement et eau)", "category": "Salon", "theme": "Environnement, Eau & Energie", "scope": "International", "source": "Messe München", "url": "https://ifat.de/"},
     {"month": 11, "day": 27, "name": "Pollutec Lyon", "category": "Salon", "theme": "Environnement, Eau & Energie", "scope": "International", "source": "RX France", "url": "https://www.pollutec.com/"},
     {"month": 11, "day": 10, "name": "COP30 - Belém", "category": "Congrès", "theme": "Environnement, Eau & Energie", "scope": "International", "source": "UNFCCC", "url": "https://unfccc.int/"},
-    {"month": 6, "day": 5, "name": "Salon Pollutec Maroc Casablanca", "category": "Salon", "theme": "Environnement, Eau & Energie", "scope": "Maroc", "source": "RX France", "url": "https://www.pollutec-maroc.com/"},
+    {"month": 10, "day": 14, "end_day": 17, "name": "GLOBAL GREEN EVENT by Pollutec Casablanca", "category": "Salon", "theme": "Environnement, Eau & Energie", "scope": "Maroc", "source": "AS Exhibitions", "url": "https://globalgreen.ma/"},
 
     # ───── (suite) Énergie & Transition ─────
     {"month": 10, "day": 22, "name": "Journée internationale des énergies renouvelables", "category": "Journée mondiale", "theme": "Environnement, Eau & Energie", "scope": "International", "source": "IRENA", "url": "https://www.irena.org/"},
@@ -1633,9 +1665,9 @@ def _events_in_window(start_date, end_date, themes=None):
         for event in _EVENTS_CATALOG:
             if selected_themes is not None and event.get("theme") not in selected_themes:
                 continue
-            evt_date = date(year, event["month"], event["day"])
-            if start_date <= evt_date <= end_date:
-                events.append({**event, "date": evt_date})
+            evt_date, evt_end_date = _event_dates_for_year(event, year)
+            if evt_date <= end_date and evt_end_date >= start_date:
+                events.append({**event, "date": evt_date, "end_date": evt_end_date})
     return sorted(events, key=lambda item: item["date"])
 
 
@@ -1735,7 +1767,7 @@ def _show_veille_details(veille, group, selected_themes, calendar_events=None):
         )
         for event in calendar_events:
             event_url = event.get("url", "")
-            header = f"📅  {_format_date_fr(event['date'])}  |  {event['name']}  |  {event['category']}"
+            header = f"📅  {_format_event_period(event['date'], event.get('end_date'))}  |  {event['name']}  |  {event['category']}"
             with st.expander(header):
                 st.markdown(f"**Catégorie :** {escape(event['category'])}")
                 if event_url:
@@ -1896,13 +1928,14 @@ def _show_events_dialog(events, themes, start_date):
         scope_chip = "🇲🇦 Maroc" if scope == "Maroc" else "🌍 International"
         url = evt.get("url", "") or "#"
         source = evt.get("source", "")
-        date_fr = _format_date_fr(d)
+        day_label, month_label = _event_card_date_parts(d, evt.get("end_date"))
+        day_class = "event-day event-day-range" if "-" in day_label else "event-day"
 
         card = (
             f'<a class="event-card" href="{escape(url, quote=True)}" target="_blank" rel="noopener">'
             f'<div class="event-date">'
-            f'<div class="event-day">{d.day:02d}</div>'
-            f'<div class="event-month">{date_fr.split(" ", 1)[1] if " " in date_fr else date_fr}</div>'
+            f'<div class="{day_class}">{escape(day_label)}</div>'
+            f'<div class="event-month">{escape(month_label)}</div>'
             f'</div>'
             f'<div class="event-body">'
             f'<div class="event-tags">'
@@ -3088,5 +3121,3 @@ else:
 
 # ─── Bottom spacing (2 empty rows at end of page) ─────────────────────────────
 st.markdown('<div style="height:80px"></div>', unsafe_allow_html=True)
-
-

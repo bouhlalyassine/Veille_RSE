@@ -2028,6 +2028,40 @@ _T1_OFF_TARGET_CROPS = (
     "pasteque", "pasteques", "fenouil", "poireau", "poireaux", "celeri", "gombo", "okra",
 )
 
+_T1_ORANGE_BRAND_MARKERS = (
+    "orange maroc", "orange business", "orange money", "orange digital",
+    "orange telecom", "orange group", "orange cyberdefense",
+    "telecom", "telecommunications", "operateur telecom", "operateur telephonique",
+    "telephonie", "reseau mobile", "mobile money", "fibre optique", "internet",
+    "5g", "4g", "cloud", "data center", "datacenter", "cybersecurite",
+    "intelligence artificielle", "ia", "digital", "numerique", "startup",
+    "start-up", "innovation technologique", "made in morocco",
+)
+_T1_ORANGE_FRUIT_CONTEXT = (
+    "agrume", "agrumes", "oranges", "citrus", "agrumicole", "filiere agrumes",
+    "maroc citrus", "campagne agrumes", "verger", "vergers", "recolte",
+    "cueillette", "production d'orange", "production orange", "prix de l'orange",
+    "prix des oranges", "jus d'orange", "export orange", "export d'orange",
+    "exportation orange", "tonnes d'orange", "tonnes d'oranges",
+    "mandarine", "mandarines", "clementine", "clementines", "nadorcott",
+    "afourer", "navel", "valencia", "maroc late", "soft citrus",
+)
+
+
+def _t1_is_orange_brand_noise(text_folded: str) -> bool:
+    """Distingue la marque Orange des oranges/agrumes.
+
+    Si Orange apparait avec un contexte telecom/IA/digital, mais sans contexte
+    fruit/agrumes, l'article ne doit pas etre rattache au theme T1.
+    """
+    if not _keyword_in_media_text(text_folded, "orange"):
+        return False
+    if not any(_keyword_in_media_text(text_folded, kw) for kw in _T1_ORANGE_BRAND_MARKERS):
+        return False
+    if any(_keyword_in_media_text(text_folded, kw) for kw in _T1_ORANGE_FRUIT_CONTEXT):
+        return False
+    return True
+
 
 def _t1_is_off_target(text_folded: str) -> bool:
     """True si l'article doit etre demote hors T1 : il porte sur une culture hors
@@ -2038,6 +2072,9 @@ def _t1_is_off_target(text_folded: str) -> bool:
     sinon des sources nommees "...Agrumes...", "...Fruits..." injecteraient un mot
     cible et neutraliseraient la garde). Word-boundary matching (ble != table).
     """
+    # 0) Homonyme "Orange" marque/telco -> demote si aucun contexte agrumes.
+    if _t1_is_orange_brand_noise(text_folded):
+        return True
     # 1) Culture cible presente -> jamais demote
     for kw in _T1_TARGET_CROPS:
         if _keyword_in_media_text(text_folded, kw):
@@ -2344,7 +2381,7 @@ except Exception:
 # Bumper cette version a chaque modification de la taxonomie (themes, keywords, sources).
 # Inclus dans le slot de cache -> invalide automatiquement le DataFrame en cache et
 # force un re-scraping a la prochaine execution.
-_TAXONOMY_VERSION = "v33"
+_TAXONOMY_VERSION = "v34"
 
 
 def current_cache_slot() -> str:
