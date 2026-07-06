@@ -51,6 +51,7 @@ MEDIA_SCOUT_THEMES = [
     "Agrumes, Fruits rouges & Maraichage",
     "Produits laitiers & Epicerie fine",
     "Elevage (Ovins, Bovins, Caprins, Volailles)",
+    "Aquaculture (elevage et transformation)",
     "Environnement, Eau & Energie",
     "ESG, QSE & SST",
 ]
@@ -58,6 +59,7 @@ MEDIA_SCOUT_THEMES = [
 MEDIA_SCOUT_THEME_EMOJI = {
     "Agrumes, Fruits rouges & Maraichage":           "🍊",
     "Elevage (Ovins, Bovins, Caprins, Volailles)":   "🐄",
+    "Aquaculture (elevage et transformation)":       "🐟",
     "Produits laitiers & Epicerie fine":             "🧀",
     "Environnement, Eau & Energie":                  "🌍",
     "ESG, QSE & SST":                                "🏛️",
@@ -197,8 +199,12 @@ MEDIA_SCOUT_SOURCE_CATALOG = [
     {"Journal": "GNews — Viande MA",       "URL": "https://news.google.com/rss/search?q=(%22filiere+viande%22+OR+%22viande+ovine%22+OR+%22viande+bovine%22+OR+%22abattoir%22+OR+%22marche+ovin%22)+Maroc&hl=fr&gl=MA&ceid=MA:fr", "Couverture": "Elevage MA — Filiere viande, abattoirs, marche ovin"},
     {"Journal": "GNews — ANOC FIVOB",       "URL": "https://news.google.com/rss/search?q=(%22ANOC%22+OR+%22FIVOB%22+OR+%22FISA%22+OR+%22FIMABE%22+OR+%22INTERPROVI%22)+Maroc&hl=fr&gl=MA&ceid=MA:fr",                    "Couverture": "Elevage MA — Federations interprofessionnelles betail"},
     {"Journal": "GNews — Lait Maroc",       "URL": "https://news.google.com/rss/search?q=(%22filiere+laitiere%22+OR+%22production+laitiere%22+OR+%22vache+laitiere%22+OR+%22centres+collecte+lait%22)+Maroc&hl=fr&gl=MA&ceid=MA:fr",  "Couverture": "Elevage MA — Filiere laitiere, vaches laitieres"},
-    {"Journal": "GNews — Aquaculture MA",   "URL": "https://news.google.com/rss/search?q=(%22aquaculture%22+OR+%22pisciculture%22+OR+%22conchyliculture%22+OR+%22ostreiculture%22+OR+%22ANDA%22)+Maroc&hl=fr&gl=MA&ceid=MA:fr", "Couverture": "Elevage MA — Aquaculture, pisciculture, conchyliculture"},
-    {"Journal": "GNews — Peche Aquaculture","URL": "https://news.google.com/rss/search?q=(%22peche%22+OR+%22halieutique%22+OR+%22produits+de+la+mer%22+OR+%22Halieutis%22)+Maroc+aquaculture&hl=fr&gl=MA&ceid=MA:fr", "Couverture": "Elevage MA — Pêche & aquaculture, produits de la mer"},
+
+    # ─── Google News RSS — Aquaculture (élevage & transformation) ──────────────
+    {"Journal": "GNews — Aquaculture MA",   "URL": "https://news.google.com/rss/search?q=(%22aquaculture%22+OR+%22pisciculture%22+OR+%22conchyliculture%22+OR+%22ostreiculture%22+OR+%22ANDA%22)+Maroc&hl=fr&gl=MA&ceid=MA:fr", "Couverture": "Aquaculture MA — pisciculture, conchyliculture, ANDA"},
+    {"Journal": "GNews — Peche Aquaculture","URL": "https://news.google.com/rss/search?q=(%22peche%22+OR+%22halieutique%22+OR+%22produits+de+la+mer%22+OR+%22Halieutis%22)+Maroc+aquaculture&hl=fr&gl=MA&ceid=MA:fr", "Couverture": "Aquaculture MA — pêche, halieutique, produits de la mer"},
+    {"Journal": "GNews — Aquaculture Monde","URL": "https://news.google.com/rss/search?q=(%22aquaculture%22+OR+%22fish+farming%22+OR+%22seafood%22+OR+%22pisciculture%22)+(%22marche%22+OR+%22production%22+OR+%22durable%22+OR+%22market%22)&hl=fr&ceid=:fr", "Couverture": "Aquaculture intl — marché, production, seafood durable"},
+    {"Journal": "GNews — Transformation Poisson","URL": "https://news.google.com/rss/search?q=(%22conserverie+de+poisson%22+OR+%22transformation+des+produits+de+la+mer%22+OR+%22farine+de+poisson%22+OR+%22surimi%22+OR+%22mareyage%22+OR+%22valorisation+halieutique%22)+Maroc&hl=fr&gl=MA&ceid=MA:fr", "Couverture": "Aquaculture MA — transformation, conserverie, mareyage"},
 
     # ─── WORLD - Environnement / Climat / Energie ──────────────────────────────
     # NB: retires car SPA/404/502 (0 article) : UNEP, WRI, TNFD, SBTi, CDP,
@@ -370,22 +376,46 @@ MEDIA_SCOUT_THEME_RULES = {
             # Filiere viande / abattage Maroc
             "sonacos", "filiere des viandes", "viande ovine",
             "viande bovine", "viande caprine", "viande avicole",
-            # Aquaculture / pisciculture (filiere ajoutee)
-            "aquaculture", "aquacole", "filiere aquacole", "ferme aquacole",
-            "pisciculture", "piscicole", "elevage piscicole", "ferme piscicole",
-            "elevage de poissons", "fish farming", "salmoniculture", "conchyliculture",
-            "ostreiculture", "mytiliculture", "huitre", "huitres", "moule", "moules",
-            "crevette", "crevettes", "daurade", "dorade", "bar ", "loup de mer",
-            "saumon d'elevage", "tilapia", "anda", "halieutique", "produits de la mer",
         ],
         "medium": [
             "animal", "animale", "animaux", "troupeau", "troupeaux", "cheptel",
             "boucher", "boucherie", "feed", "ferme d'elevage", "exploitation d'elevage",
             "production animale", "filiere animale",
-            "poisson", "poissons", "fruits de mer", "algue", "algues",
         ],
         "weak": [
             "race animale",
+        ],
+    },
+    "Aquaculture (elevage et transformation)": {
+        # Filiere aquacole LDA : elevage aquatique + transformation / valorisation.
+        "strong": [
+            # -- Elevage aquatique --
+            "aquaculture", "aquacole", "aquacoles", "filiere aquacole", "ferme aquacole",
+            "aquaculture marine", "pisciculture", "piscicole", "elevage piscicole",
+            "ferme piscicole", "elevage de poissons", "poisson d'elevage", "poissons d'elevage",
+            "fish farming", "salmoniculture", "conchyliculture", "ostreiculture",
+            "mytiliculture", "algoculture", "ecloserie", "ecloseries", "alevin", "alevins",
+            "aliment aquacole", "spiruline", "microalgue", "microalgues", "macroalgue",
+            # -- Especes d'elevage (non ambigues) --
+            "huitre", "huitres", "moule", "moules", "crevette", "crevettes",
+            "daurade", "dorade", "tilapia", "truite", "saumon d'elevage", "loup de mer",
+            # -- Transformation / valorisation des produits de la mer --
+            "transformation des produits de la mer", "conserverie de poisson",
+            "conserve de poisson", "conserves de poisson", "farine de poisson",
+            "huile de poisson", "surimi", "mareyage", "mareyeur", "filet de poisson",
+            "valorisation halieutique", "industrie halieutique",
+            # -- Peche / halieutique (contexte marin cible) --
+            "halieutique", "produits halieutiques", "produits de la mer",
+            "peche maritime", "peche cotiere", "peche artisanale",
+            # -- Institutions / evenements Maroc --
+            "anda", "inrh", "office national des peches", "halieutis",
+        ],
+        "medium": [
+            "poisson", "poissons", "fruits de mer", "algue", "algues",
+            "onp", "criee", "port de peche", "aquafeed",
+        ],
+        "weak": [
+            "aquaculteur", "aquaculteurs", "pisciculteur", "pisciculteurs",
         ],
     },
     "Produits laitiers & Epicerie fine": {
@@ -760,8 +790,11 @@ MEDIA_SCOUT_FORCED_SOURCE_THEMES = {
     "GNews — Viande MA":                "Elevage (Ovins, Bovins, Caprins, Volailles)",
     "GNews — ANOC FIVOB":               "Elevage (Ovins, Bovins, Caprins, Volailles)",
     "GNews — Lait Maroc":               "Elevage (Ovins, Bovins, Caprins, Volailles)",
-    "GNews — Aquaculture MA":           "Elevage (Ovins, Bovins, Caprins, Volailles)",
-    "GNews — Peche Aquaculture":        "Elevage (Ovins, Bovins, Caprins, Volailles)",
+    # ── Google News RSS - Aquaculture (forces vers le theme dedie) ────────
+    "GNews — Aquaculture MA":           "Aquaculture (elevage et transformation)",
+    "GNews — Peche Aquaculture":        "Aquaculture (elevage et transformation)",
+    "GNews — Aquaculture Monde":        "Aquaculture (elevage et transformation)",
+    "GNews — Transformation Poisson":   "Aquaculture (elevage et transformation)",
 
     # ── WORLD - Environnement / Climat / Energie (sources qui marchent) ───
     "Climate Home News":                "Environnement, Eau & Energie",
@@ -839,8 +872,10 @@ MEDIA_SCOUT_SOURCE_ORIGINS = {
     "GNews — Viande MA": "International",
     "GNews — ANOC FIVOB": "International",
     "GNews — Lait Maroc": "International",
-    "GNews — Aquaculture MA": "International",
-    "GNews — Peche Aquaculture": "International",
+    "GNews — Aquaculture MA": "Maroc",
+    "GNews — Peche Aquaculture": "Maroc",
+    "GNews — Aquaculture Monde": "International",
+    "GNews — Transformation Poisson": "Maroc",
     # Veille Concurrentielle T3 — intelligence par categorie
     "GNews — Presse éco MA": "Maroc",
     "La Vie Éco": "Maroc",
@@ -997,8 +1032,10 @@ MEDIA_SCOUT_SOURCE_ZONES = {
     "GNews — Viande MA":                      "WORLD",
     "GNews — ANOC FIVOB":                     "WORLD",
     "GNews — Lait Maroc":                     "WORLD",
-    "GNews — Aquaculture MA":                 "WORLD",
-    "GNews — Peche Aquaculture":              "WORLD",
+    "GNews — Aquaculture MA":                 "MAROC",
+    "GNews — Peche Aquaculture":              "MAROC",
+    "GNews — Aquaculture Monde":              "WORLD",
+    "GNews — Transformation Poisson":         "MAROC",
     # Google News RSS - BACKFILL T4 Environnement + T5 Normes
     "GNews — Eau Maroc":                      "WORLD",
     "GNews — Energie Maroc":                  "WORLD",
@@ -1650,7 +1687,7 @@ _FILTER_OTHER_ANIMALS_MARKERS = (
     # Apiculture (elevage d'abeilles - distinct de miel produit fini)
     "apicult", "apiculteur", "apicultrice", "elevage d'abeilles", "elevage abeille",
     "ruche", "ruches", "filiere apicole",
-    # NB: pisciculture / aquaculture NE SONT PLUS exclues (theme T2 etendu a l'aquaculture)
+    # NB: pisciculture / aquaculture NON exclues (thème dédié "Aquaculture")
     # Cunicole (lapin)
     " lapin ", " lapins ", "cuniculture", "cunicole", "filiere cunicole",
     " lievre ", " lievres ", "elevage cunicole", "viande de lapin",
@@ -1893,12 +1930,6 @@ _T2_LIVESTOCK_SPECIES = (
     "aid al adha", "aid el adha", "aid el kebir", "aid kebir",
     "aid adha", "eid al adha", "eid el kebir", "fete du sacrifice",
     "sacrifice du mouton", "tabaski", "souk al kbach", "souk kbach",
-    # Aquaculture / pisciculture (filiere ajoutee au scope T2)
-    "aquaculture", "aquacole", "pisciculture", "piscicole", "salmoniculture",
-    "conchyliculture", "ostreiculture", "mytiliculture", "halieutique",
-    "poisson", "poissons", "huitre", "huitres", "moule", "moules",
-    "crevette", "crevettes", "daurade", "dorade", "tilapia", "saumon",
-    "produits de la mer", "fruits de mer", "fish farming", "anda",
     # Federations
     "anoc", "fivob", "fisa ", "fimabe", "interprovi", "sonacos",
 )
@@ -2370,6 +2401,13 @@ def _should_keep_article(row):
 # ─── Cache schedule (refresh aux heures fixes Maroc) ──────────────────────────
 # Le scraping global se rafraichit a CES heures (heure locale Maroc) :
 SCHEDULED_REFRESH_HOURS = [7, 19]  # 07h00 et 19h00 (modifiable)
+
+# Fenetre de collecte : seuls les articles des N derniers jours sont conserves.
+# Applique tres tot dans le pipeline (avant classification, validation LLM et
+# traduction) -> reduit fortement le volume traite, le temps de refresh aux
+# creneaux 07h/19h et les tokens LLM consommes. Aligne sur le date-picker de
+# l'app (max 15 jours).
+MEDIA_SCOUT_MAX_AGE_DAYS = 15
 try:
     _TZ_MAROC = ZoneInfo("Africa/Casablanca")
 except Exception:
@@ -2381,7 +2419,7 @@ except Exception:
 # Bumper cette version a chaque modification de la taxonomie (themes, keywords, sources).
 # Inclus dans le slot de cache -> invalide automatiquement le DataFrame en cache et
 # force un re-scraping a la prochaine execution.
-_TAXONOMY_VERSION = "v34"
+_TAXONOMY_VERSION = "v35"
 
 
 def current_cache_slot() -> str:
@@ -2412,7 +2450,7 @@ def _datetime_maroc() -> datetime:
     return datetime.now(_TZ_MAROC)
 
 
-@st.cache_data(show_spinner=False)  # cle = slot (meme que data_media_scout)
+@st.cache_data(show_spinner=False, persist="disk")  # cle = slot (meme que data_media_scout)
 def media_scrape_timestamp(slot: str = "") -> datetime:
     """Horodatage reel de la derniere collecte de donnees (heure Maroc).
 
@@ -2433,15 +2471,19 @@ def format_last_update(dt: datetime) -> str:
     return dt.strftime("%d/%m/%Y · %Hh%M")
 
 
-@st.cache_data(show_spinner=False)  # TTL pilote par slot (cf. current_cache_slot)
+@st.cache_data(show_spinner=False, persist="disk")  # TTL pilote par slot (cf. current_cache_slot)
 def data_media_scout(urls=None, slot: str = ""):
     """Scraping global. La param 'slot' fait partie de la cle de cache : son
     changement (declenche a 07h00 / 19h00) force un re-scraping. Le slot a
-    passer est current_cache_slot() — fournit par l'app au moment de l'appel."""
+    passer est current_cache_slot() — fournit par l'app au moment de l'appel.
+
+    persist="disk" : le resultat est aussi ecrit sur disque -> si le conteneur
+    Streamlit Cloud redemarre (reveil apres mise en veille, reboot), le cache du
+    creneau courant est recharge instantanement au lieu de re-scraper."""
     urls = urls or MEDIA_SCOUT_URLS
     source_urls = [source["URL"] if isinstance(source, dict) else source for source in urls]
 
-    # Scraping PARALLELE : les ~90 sources sont fetchees concurremment (I/O reseau
+    # Scraping PARALLELE : les ~65 sources sont fetchees concurremment (I/O reseau
     # => le GIL est libere pendant les requetes). Une source lente/morte ne bloque
     # plus les autres. Speedup typique 5-10x vs boucle sequentielle.
     data = []
@@ -2460,6 +2502,17 @@ def data_media_scout(urls=None, slot: str = ""):
     df["Date"] = df["Date"].apply(_normalize_media_date)
     df["Date"] = pd.to_datetime(df["Date"], format="%d/%m/%Y", errors="coerce")
     df = df.dropna(subset=["Date", "Title", "Link"])
+
+    # ── Fenetre de collecte (15 jours) : coupe AVANT tout traitement lourd ──
+    # Les articles plus vieux ne sont jamais affichables (picker max 15j) ;
+    # les ecarter ici evite classification + validation LLM + traduction inutiles.
+    _cutoff = pd.Timestamp(_datetime_maroc().date()) - pd.Timedelta(days=MEDIA_SCOUT_MAX_AGE_DAYS)
+    df = df[df["Date"] >= _cutoff]
+    if df.empty:
+        empty_df = pd.DataFrame(columns=columns)
+        empty_df["Date"] = pd.to_datetime(empty_df["Date"])
+        return empty_df
+
     # Filtre pre-classification : exclure offres emploi, auto, sante pure, ONCF, non-Maroc
     # .copy() -> df autonome (evite SettingWithCopyWarning sur les ecritures de colonnes).
     df = df[~df.apply(_should_exclude_article, axis=1)].copy()
@@ -2773,6 +2826,10 @@ _groq_chat_with_failover = _llm_chat_with_failover
 # de data_media_scout (slot-based), donc ne s'execute que 2x/jour.
 
 _LLM_VALIDATE_CHUNK_SIZE = 25  # nb max d'articles par batch LLM (token budget)
+# Nb d'appels LLM simultanes (validation + traduction). Modere volontairement :
+# assez pour diviser le temps de refresh par ~4, sans saturer les rate limits
+# free tier (le failover multi-cles absorbe les 429 residuels).
+_LLM_PARALLEL_WORKERS = 4
 
 
 def _llm_validate_chunk(items: list, theme_label: str) -> set:
@@ -2852,34 +2909,45 @@ def _llm_validate_themes(df):
     """Pour chaque article du df, demande au LLM si son titre est strictement lie
     au theme assigne. Drop les articles juges off-topic.
 
-    Cette fonction est appelee dans data_media_scout (cache 12h via slot).
-    Avec failover multi-cles, supporte ~5-10 batches par session sans atteindre
-    le rate limit de la free tier.
+    Cette fonction est appelee dans data_media_scout (cache par creneau 07h/19h).
+    Les chunks sont envoyes en PARALLELE (les appels LLM sont de l'I/O reseau :
+    le GIL est libere) -> temps de refresh divise par ~len(workers) vs boucle
+    sequentielle. Chaque chunk est independant ; les resultats sont fusionnes
+    dans le thread principal (aucune ecriture concurrente sur df / keep_mask).
+    Avec failover multi-cles, un rate limit sur une cle bascule sur la suivante.
     """
     if not _has_any_llm_key() or df.empty:
         return df
 
-    keep_mask = pd.Series(True, index=df.index)
-
+    # Construit la liste plate des chunks (theme, items) a valider
+    chunks = []
     for theme in MEDIA_SCOUT_THEMES:
         theme_rows = df[df["Theme"] == theme]
         if theme_rows.empty:
             continue
-
-        # Build items : list of (df_idx, title)
         items = [
             (idx, str(row["Title"])[:200])
             for idx, row in theme_rows.iterrows()
         ]
-
-        # Process par chunks (token budget LLM)
         for chunk_start in range(0, len(items), _LLM_VALIDATE_CHUNK_SIZE):
-            chunk = items[chunk_start:chunk_start + _LLM_VALIDATE_CHUNK_SIZE]
-            valid_df_indices = _llm_validate_chunk(chunk, theme)
-            # Drop les indices qui ne sont PAS dans valid
-            for df_idx, _ in chunk:
-                if df_idx not in valid_df_indices:
-                    keep_mask[df_idx] = False
+            chunks.append((items[chunk_start:chunk_start + _LLM_VALIDATE_CHUNK_SIZE], theme))
+
+    if not chunks:
+        return df
+
+    # Appels LLM en parallele (pool modere : respecte les rate limits free tier,
+    # le failover multi-cles absorbe les 429 ponctuels).
+    with ThreadPoolExecutor(max_workers=min(_LLM_PARALLEL_WORKERS, len(chunks))) as executor:
+        results = list(executor.map(
+            lambda cw: (cw[0], _llm_validate_chunk(cw[0], cw[1])), chunks
+        ))
+
+    # Fusion des verdicts dans le thread principal
+    keep_mask = pd.Series(True, index=df.index)
+    for chunk_items, valid_df_indices in results:
+        for df_idx, _ in chunk_items:
+            if df_idx not in valid_df_indices:
+                keep_mask[df_idx] = False
 
     return df[keep_mask].copy()
 
@@ -3047,9 +3115,9 @@ def _translate_articles_to_french(df):
     if not todo:
         return df
 
-    for start in range(0, len(todo), _TRANSLATE_CHUNK_SIZE):
-        chunk = todo[start:start + _TRANSLATE_CHUNK_SIZE]
-        # Construit la liste numerotee a traduire
+    def _translate_chunk(chunk):
+        """Traduit un lot. Retourne [(df_idx, titre_fr, resume_fr), ...] —
+        l'ecriture dans df se fait dans le thread principal (thread-safe)."""
         listed = "\n".join(
             f"[{i}] TITRE: {t[:200]}\n    RESUME: {d[:400]}"
             for i, (_, t, d) in enumerate(chunk)
@@ -3063,6 +3131,7 @@ def _translate_articles_to_french(df):
             "Reponds UNIQUEMENT en JSON strict, sans markdown :\n"
             '{"articles":[{"i":<num>,"titre":"<titre FR>","resume":"<resume FR>"}, ...]}'
         )
+        out = []
         try:
             resp = _llm_chat_with_failover(
                 messages=[
@@ -3087,16 +3156,31 @@ def _translate_articles_to_french(df):
                     continue
                 if not (0 <= i < len(chunk)):
                     continue
-                df_idx = chunk[i][0]
-                titre_fr = str(art.get("titre", "")).strip()
-                resume_fr = str(art.get("resume", "")).strip()
-                if titre_fr:
-                    df.loc[df_idx, "Title"] = titre_fr
-                if resume_fr:
-                    df.loc[df_idx, "Description"] = resume_fr
+                out.append((
+                    chunk[i][0],
+                    str(art.get("titre", "")).strip(),
+                    str(art.get("resume", "")).strip(),
+                ))
         except Exception:
-            # Fail-safe : on garde les textes originaux de ce lot
-            continue
+            # Fail-safe : lot ignore -> textes originaux conserves
+            pass
+        return out
+
+    chunks = [
+        todo[start:start + _TRANSLATE_CHUNK_SIZE]
+        for start in range(0, len(todo), _TRANSLATE_CHUNK_SIZE)
+    ]
+    # Traduction des lots en PARALLELE (I/O reseau -> GIL libere)
+    with ThreadPoolExecutor(max_workers=min(_LLM_PARALLEL_WORKERS, len(chunks))) as executor:
+        all_results = list(executor.map(_translate_chunk, chunks))
+
+    # Application des traductions dans le thread principal
+    for results in all_results:
+        for df_idx, titre_fr, resume_fr in results:
+            if titre_fr:
+                df.loc[df_idx, "Title"] = titre_fr
+            if resume_fr:
+                df.loc[df_idx, "Description"] = resume_fr
 
     return df
 

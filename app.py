@@ -16,7 +16,6 @@ from Settings import (
     MEDIA_SCOUT_URLS,
     MEDIA_SCOUT_THEMES,
     MEDIA_SCOUT_THEME_EMOJI,
-    MEDIA_SCOUT_VEILLES,
     MEDIA_SCOUT_VEILLE_EMOJI,
     MEDIA_SCOUT_FORCED_SOURCE_THEMES,
     MEDIA_SCOUT_SOURCE_ZONES,
@@ -42,10 +41,12 @@ st.set_page_config(
 load_css()
 
 
-# ─── Pre-warm cache (scraping global au demarrage, cache 10h) ─────────────────
-# data_media_scout est l'unique source : decoree @st.cache_data(ttl=36000),
-# on l'appelle ici pour peupler le cache au demarrage. Tous les appels suivants
-# (rendu du tableau de bord Veille) hit le cache en quelques millisecondes.
+# ─── Pre-warm cache (scraping global au demarrage) ────────────────────────────
+# data_media_scout est l'unique source : decoree @st.cache_data(persist="disk"),
+# cle de cache pilotee par le slot (07h00 / 19h00). On l'appelle ici pour peupler
+# le cache au demarrage ; tous les appels suivants (rendu du tableau de bord)
+# hit le cache en quelques millisecondes. persist="disk" -> le cache survit aux
+# redemarrages du conteneur (Streamlit Cloud) au sein d'un meme creneau.
 with st.spinner("Recherche d'actualités en cours sur l'ensemble des sources (2 mises à jour paramétrées : 7h00 et 19h00) — quelques minutes…"):
     _slot = current_cache_slot()
     data_media_scout(MEDIA_SCOUT_URLS, slot=_slot)
@@ -134,7 +135,8 @@ def _veille_display(veille: str) -> str:
 def _theme_display(theme: str) -> str:
     return {
         "Agrumes, Fruits rouges & Maraichage":           "🍊 Agrumes, Fruits rouges & Tomates cerises",
-        "Elevage (Ovins, Bovins, Caprins, Volailles)":   "🐄 Élevage (Ovins, Bovins, Caprins, Volailles & Aquaculture)",
+        "Elevage (Ovins, Bovins, Caprins, Volailles)":   "🐄 Élevage (Ovins, Bovins, Caprins & Volailles)",
+        "Aquaculture (elevage et transformation)":       "🐟 Aquaculture (élevage & transformation)",
         "Produits laitiers & Epicerie fine":             "🧀 Produits laitiers & Épicerie fine",
         "Environnement, Eau & Energie":                  "🌍 Environnement, Eau & Énergie",
         "ESG, QSE & SST":                                "🏛️ Normes : ESG, QSE & SST",
@@ -151,6 +153,7 @@ def _theme_plain(theme: str) -> str:
 _THEME_COLORS = {
     "Agrumes, Fruits rouges & Maraichage":           "#E8833A",  # orange agrumes
     "Elevage (Ovins, Bovins, Caprins, Volailles)":   "#9268C2",  # violet
+    "Aquaculture (elevage et transformation)":       "#2E9CAF",  # bleu-vert / aqua
     "Produits laitiers & Epicerie fine":             "#C9A227",  # ambre/or
     "Environnement, Eau & Energie":                  "#4FA268",  # vert
     "ESG, QSE & SST":                                "#5C84C4",  # bleu normes
@@ -177,32 +180,36 @@ def _zone_priority(source_name: str) -> int:
 # ─── CSS — design tokens + components ─────────────────────────────────────────
 def _design_css(dark: bool = False, frozen: bool = True) -> str:
     if dark:
+        # Vrai dark mode : surfaces charbon NEUTRES (plus de brun), encre ivoire,
+        # accents or eclaircis pour le contraste. L'identite DA (or + serif) reste.
         palette = """
 :root{
-  --paper:#2E2A24;
-  --paper-2:#39342D;
-  --paper-3:#443E35;
-  --ink:#EDE3CC;
-  --ink-2:#D2C3A4;
-  --ink-3:#9C8C71;
-  --ink-4:#776B55;
-  --line:#48413A;
-  --line-soft:#3E382F;
-  --line-strong:#7C6D4E;
-  --gold:#C2A66B;
-  --gold-deep:#A89060;
-  --plum:#B59CCA;
-  --plum-soft:#3F3349;
-  --alert:#C76858;
-  --alert-soft:#4D2922;
-  --alert-deep:#E8C9BD;
-  --teal:#80A0AE;
-  --teal-soft:#2C4654;
-  --teal-deep:#A8C2CD;
-  --teal-darker:#C5DBE3;
-  --green:#95AB75;
-  --green-soft:#33401E;
-  --green-deep:#DCEAC5;
+  --paper:#111316;
+  --paper-2:#1A1D22;
+  --paper-3:#24282F;
+  --ink:#ECE9E1;
+  --ink-2:#C8C3B7;
+  --ink-3:#918B7D;
+  --ink-4:#686257;
+  --line:#2D3037;
+  --line-soft:#22252B;
+  --line-strong:#8A7A52;
+  --gold:#D2B677;
+  --gold-deep:#B79E66;
+  --plum:#C3A6D8;
+  --plum-soft:#2E2839;
+  --alert:#DD7A67;
+  --alert-soft:#3B241F;
+  --alert-deep:#F0CCC1;
+  --teal:#82AEC2;
+  --teal-soft:#1D323D;
+  --teal-deep:#B3D2DF;
+  --teal-darker:#CFE5EF;
+  --green:#9CBB74;
+  --green-soft:#27331C;
+  --green-deep:#DFEBCB;
+  --select-fill:#2A2E36;
+  --evt-card-bg:#1A1D22;
   --tracking:.14em;
   --tracking-loose:.22em;
 }
@@ -234,6 +241,8 @@ def _design_css(dark: bool = False, frozen: bool = True) -> str:
   --green:#5E7A3A;
   --green-soft:#D9E5C6;
   --green-deep:#162310;
+  --select-fill:#C5B489;
+  --evt-card-bg:#CFE0E6;
   --tracking:.14em;
   --tracking-loose:.22em;
 }
@@ -505,15 +514,32 @@ div[data-testid="stAppViewContainer"] main .block-container{
 [data-baseweb="select"] [role="option"]{
     color:var(--ink) !important;
 }
-[data-baseweb="menu"]{
-    background:var(--paper) !important;
+/* Liste déroulante (selectbox / multiselect) : le PANNEAU INTERNE du popover
+   BaseWeb + la listbox + chaque option sont peints en blanc par le thème
+   Streamlit statique -> on les rebase sur la palette (suit le dark mode).
+   Scope :has([role="listbox"]) pour ne pas toucher le calendrier du date input. */
+[data-baseweb="popover"]:has([role="listbox"]) > div{
+    background:var(--paper-2) !important;
     border:1px solid var(--line-strong) !important;
 }
-[data-baseweb="menu"] [role="option"]:hover{
+[data-baseweb="popover"] [role="listbox"],
+ul[data-testid="stSelectboxVirtualDropdown"],
+[data-baseweb="menu"]{
     background:var(--paper-2) !important;
 }
+[data-baseweb="popover"] [role="option"],
+[data-baseweb="menu"] [role="option"]{
+    background:var(--paper-2) !important;
+    color:var(--ink) !important;
+}
+[data-baseweb="popover"] [role="option"]:hover,
+[data-baseweb="popover"] [role="option"][aria-selected="true"],
+[data-baseweb="menu"] [role="option"]:hover{
+    background:var(--paper-3) !important;
+    color:var(--ink) !important;
+}
 
-/* Bouton navigation À Propos / Veille DA — 2 etats bien distincts & visibles */
+/* Bouton navigation Sources / Veille DA — 2 etats bien distincts & visibles */
 /* Base commune (forme, taille) */
 .st-key-nav_apropos button,
 .st-key-nav_veille button{
@@ -527,7 +553,7 @@ div[data-testid="stAppViewContainer"] main .block-container{
 .st-key-nav_apropos button p,
 .st-key-nav_veille button p{ font-weight:800 !important; font-size:14px !important; }
 
-/* Les 2 etats (À Propos ET Veille DA) ont le MEME style : contour gold + fond
+/* Les 2 etats (Sources ET Veille DA) ont le MEME style : contour gold + fond
    ambré clair au repos -> remplissage gold + texte crème au survol. */
 .st-key-nav_apropos button,
 .st-key-nav_veille button{
@@ -552,6 +578,21 @@ div[data-testid="stAppViewContainer"] main .block-container{
 }
 .st-key-filter-row [data-baseweb="select"]:hover {
     border-color:var(--line-strong) !important;
+}
+/* Fond du CONTROL BaseWeb interne du select : sans override il garde le
+   secondaryBackgroundColor beige de config.toml (statique) -> illisible en
+   dark mode. --select-fill suit la palette (light = beige identique, dark =
+   charbon). Concerne le selectbox thème + les filtres du dialog Concurrentielle. */
+.st-key-filter-row [data-baseweb="select"] > div,
+.st-key-con_ptype_filter [data-baseweb="select"] > div,
+.st-key-con_pcat_filter [data-baseweb="select"] > div{
+    background:var(--select-fill) !important;
+    border-color:var(--line-strong) !important;
+}
+.st-key-filter-row [data-baseweb="select"] svg,
+.st-key-con_ptype_filter [data-baseweb="select"] svg,
+.st-key-con_pcat_filter [data-baseweb="select"] svg{
+    fill:var(--ink-2) !important;
 }
 /* Multiselect tags as chips */
 .st-key-filter-row [data-baseweb="tag"] {
@@ -870,8 +911,19 @@ div[data-testid="stAppViewContainer"] main .block-container{
 }
 
 /* ────────── DIALOG (expanders) ────────── */
-[data-testid="stDialog"]{
+/* Le modal Streamlit est en COUCHES : wrapper stDialog + panneau arrondi
+   role="dialog" (peint en blanc par le theme statique) + wrappers internes.
+   On rebase toutes les couches sur la palette -> plus de blanc en dark mode. */
+[data-testid="stDialog"],
+[data-testid="stDialog"] > div,
+[data-testid="stDialog"] div[role="dialog"],
+div[role="dialog"][aria-modal="true"]{
     background: var(--paper) !important;
+}
+/* Bouton de fermeture (✕) du dialog : suit l'encre de la palette */
+[data-testid="stDialog"] button[aria-label="Close"],
+[data-testid="stDialog"] button[aria-label="Fermer"]{
+    color: var(--ink-2) !important;
 }
 /* Masque le titre par defaut "Detail de la veille" */
 [data-testid="stDialog"] > div > div:first-child > div:first-child{
@@ -928,37 +980,6 @@ div[data-testid="stAppViewContainer"] main .block-container{
 }
 .scout-expander-link:hover { color:var(--gold); text-decoration:underline; }
 
-/* ────────── PRESENTATION PANELS (toggle off) ────────── */
-.presentation-card{
-    background:var(--paper);
-    border:4px solid var(--line-strong);
-    border-left:6px solid var(--gold);
-    border-radius:12px;
-    padding:22px 26px;
-    margin-bottom:0;
-    height:100%;
-    min-height:230px;
-    box-shadow:0 1px 0 0 rgba(74,64,48,.04), 0 8px 18px -14px rgba(74,64,48,.22);
-}
-.presentation-card .eyebrow{ color:var(--gold-deep); margin-bottom:12px;
-    font-family:"Inter" !important; font-weight:800 !important; font-size:15px !important;
-    letter-spacing:.18em !important; text-transform:uppercase !important;
-}
-.presentation-card h4{
-    font-family:"Cinzel", serif !important; font-weight:600 !important; font-size:16px !important;
-    letter-spacing:.12em !important; text-transform:uppercase !important;
-    margin:0 0 12px !important; color:var(--ink) !important; line-height:1.3 !important;
-}
-.presentation-card p, .presentation-card li{
-    font-family:"Inter" !important; font-size:14px !important; line-height:1.6 !important;
-    color:var(--ink-2) !important; margin:0 !important;
-}
-.presentation-card ol, .presentation-card ul{
-    margin:6px 0 0 18px !important; padding:0 !important;
-}
-.presentation-card li{ margin-bottom:6px !important; }
-.presentation-card b{ color:var(--ink); font-weight:600; }
-
 /* ────────── LANDING : boutons de thème (dégradé + emoji filigrane) ────────── */
 /* Base commune. Le dégradé de fond + l'emoji filigrane (::after) sont injectés
    dynamiquement par thème (couleur dédiée) dans le bloc landing. */
@@ -988,16 +1009,11 @@ div[data-testid="stAppViewContainer"] main .block-container{
     text-shadow:0 1px 3px var(--paper) !important;        /* lisibilité sur le dégradé */
 }
 
-/* Sources section heading */
+/* Sources section heading (compact : plus de <br> ni de trait separateur) */
 .sources-heading{
     font-family:"Cinzel", serif !important; font-weight:700 !important; font-size:20px !important;
     letter-spacing:.14em !important; text-transform:uppercase !important; color:var(--ink) !important;
-    text-align:center; margin:36px 0 14px;
-    padding-top:26px; border-top:1px solid var(--line); position:relative;
-}
-.sources-heading::after{
-    content:""; position:absolute; left:50%; transform:translateX(-50%); top:-1px;
-    width:120px; height:2px; background:var(--gold);
+    text-align:center; margin:8px 0 14px;
 }
 .sources-heading small{
     display:block; font-family:"Cormorant Garamond", serif !important; font-style:italic;
@@ -1005,80 +1021,55 @@ div[data-testid="stAppViewContainer"] main .block-container{
     color:var(--ink-2) !important; text-transform:none; margin-top:10px;
 }
 
-/* Sources dataframe : harmonise au theme papier + bordure or (light + dark) */
-[data-testid="stDataFrame"]{
-    border:3px solid var(--line-strong) !important;
-    border-radius:12px !important;
-    overflow:hidden !important;
-    background:var(--paper) !important;
-    box-shadow:0 1px 0 0 rgba(74,64,48,.04), 0 10px 22px -16px rgba(74,64,48,.28) !important;
-    /* Glide DataGrid CSS variables : pilote les couleurs du canvas interne */
-    --gdg-bg-cell:var(--paper) !important;
-    --gdg-bg-cell-medium:var(--paper-2) !important;
-    --gdg-bg-header:var(--paper-2) !important;
-    --gdg-bg-header-has-focus:var(--paper-3) !important;
-    --gdg-bg-header-hovered:var(--paper-3) !important;
-    --gdg-border-color:var(--line-strong) !important;
-    --gdg-horizontal-border-color:var(--line-soft) !important;
-    --gdg-text-dark:var(--ink) !important;
-    --gdg-text-light:var(--ink) !important;
-    --gdg-text-medium:var(--ink-2) !important;
-    --gdg-text-header:var(--ink) !important;
-    --gdg-text-header-selected:var(--ink) !important;
-    --gdg-text-group-header:var(--ink) !important;
-    --gdg-accent-color:var(--gold) !important;
-    --gdg-accent-light:var(--gold-deep) !important;
-    --gdg-bg-bubble:var(--paper-2) !important;
-    --gdg-bg-bubble-selected:var(--gold) !important;
-    --gdg-link-color:var(--gold-deep) !important;
-    --gdg-cell-horizontal-padding:12px !important;
-    --gdg-header-bottom-border-color:var(--line-strong) !important;
+/* Sources : table HTML custom. Remplace st.dataframe, dont le canvas
+   (glide-data-grid) recoit ses couleurs du theme Streamlit statique
+   (config.toml) et IGNORE nos variables CSS -> restait clair en dark mode.
+   Cette table suit la palette light/dark et la DA (or + Cinzel). */
+/* Page Sources : conteneur eligible a une largeur superieure */
+div[data-testid="stAppViewContainer"] main .block-container:has(.st-key-sources-table){
+    max-width:1760px !important;
 }
-[data-testid="stDataFrame"] [data-testid="stTableStyledTable"],
-[data-testid="stDataFrame"] table{
-    background:var(--paper) !important;
-    color:var(--ink) !important;
+.st-key-sources-table .sources-table-wrap{
+    border:3px solid var(--line-strong);
+    border-radius:12px;
+    overflow:auto;                 /* scroll vertical + horizontal (mobile) */
+    max-height:70vh;
+    background:var(--paper);
+    box-shadow:0 1px 0 0 rgba(74,64,48,.04), 0 10px 22px -16px rgba(74,64,48,.28);
 }
-[data-testid="stDataFrame"] [role="columnheader"],
-[data-testid="stDataFrame"] thead th{
-    background:var(--paper-2) !important;
-    color:var(--ink) !important;
-    font-family:"Cinzel", serif !important;
-    font-weight:700 !important;
-    letter-spacing:.10em !important;
-    text-transform:uppercase !important;
-    font-size:11.5px !important;
-    border-bottom:2px solid var(--line-strong) !important;
-    padding:10px 12px !important;
+table.sources-table{
+    width:100%;
+    min-width:980px;               /* mobile : scroll horizontal, pas d'ecrasement */
+    border-collapse:separate; border-spacing:0;
+    font-family:"Inter", sans-serif;
 }
-[data-testid="stDataFrame"] [role="row"]{
-    border-bottom:1px solid var(--line-soft) !important;
+.sources-table thead th{
+    position:sticky; top:0; z-index:2;
+    background:var(--paper-2);
+    color:var(--ink);
+    font-family:"Cinzel", serif; font-weight:700;
+    letter-spacing:.10em; text-transform:uppercase;
+    font-size:11.5px; text-align:left; white-space:nowrap;
+    padding:12px 14px;
+    border-bottom:2px solid var(--line-strong);
 }
-[data-testid="stDataFrame"] [role="gridcell"],
-[data-testid="stDataFrame"] tbody td{
-    color:var(--ink-2) !important;
-    font-family:"Inter", sans-serif !important;
-    font-size:13px !important;
-    padding:8px 12px !important;
-    background:var(--paper) !important;
+.sources-table tbody td{
+    padding:9px 14px;
+    font-size:13px; line-height:1.45;
+    color:var(--ink-2);
+    border-bottom:1px solid var(--line-soft);
+    background:var(--paper);
+    vertical-align:top;
 }
-[data-testid="stDataFrame"] [role="row"]:nth-child(even) [role="gridcell"],
-[data-testid="stDataFrame"] tbody tr:nth-child(even) td{
-    background:var(--paper-2) !important;
+.sources-table tbody tr:nth-child(even) td{ background:var(--paper-2); }
+.sources-table tbody tr:hover td{ background:var(--paper-3); }
+.sources-table tbody tr:last-child td{ border-bottom:none; }
+.sources-table td.src-name{ color:var(--ink); font-weight:600; white-space:nowrap; }
+.sources-table td.src-nowrap{ white-space:nowrap; }
+.sources-table a.src-link{
+    color:var(--gold-deep); font-weight:700; text-decoration:none; white-space:nowrap;
 }
-[data-testid="stDataFrame"] [role="row"]:hover [role="gridcell"],
-[data-testid="stDataFrame"] tbody tr:hover td{
-    background:var(--paper-3) !important;
-}
-[data-testid="stDataFrame"] a{
-    color:var(--gold-deep) !important;
-    font-weight:600 !important;
-    text-decoration:none !important;
-}
-[data-testid="stDataFrame"] a:hover{
-    color:var(--gold) !important;
-    text-decoration:underline !important;
-}
+.sources-table a.src-link:hover{ color:var(--gold); text-decoration:underline; }
 
 /* Bouton "Telecharger (Excel)" — meme langage visuel que les cadres */
 .st-key-dl_sources_xlsx button{
@@ -1233,7 +1224,9 @@ div[data-testid="stAppViewContainer"] main .block-container{
     padding:12px 14px;
     border:2px solid var(--teal);
     border-radius:12px;
-    background:var(--teal-soft);
+    /* --evt-card-bg : bleu pale en light (inchange), charbon en dark — le teal
+       reste un ACCENT (bordure, jour, fleche), pas un remplissage petrole. */
+    background:var(--evt-card-bg);
     text-decoration:none !important;
     color:var(--ink) !important;
     transition:transform 160ms ease, border-color 160ms ease, box-shadow 160ms ease, background 160ms ease;
@@ -1525,16 +1518,6 @@ div[data-testid="stAppViewContainer"] main .block-container{
     .sources-heading{ font-size:17px !important; }
     .sources-heading small{ font-size:11px !important; }
 
-    /* ── Presentation cards : padding reduit ── */
-    .presentation-card{
-        padding:16px 18px !important;
-        min-height:auto !important;
-        margin-bottom:12px !important;
-    }
-    .presentation-card .eyebrow{ font-size:11px !important; }
-    .presentation-card p,
-    .presentation-card li{ font-size:13.5px !important; line-height:1.55 !important; }
-
     /* ── Dialog scout summary : font lisible ── */
     .scout-expander-summary{ font-size:13px !important; }
     .scout-theme-divider{ font-size:12px !important; }
@@ -1619,13 +1602,18 @@ _EVENTS_CATALOG = [
     {"month": 2, "day": 21, "name": "Salon International de l'Agriculture Paris", "category": "Salon", "theme": "Agrumes, Fruits rouges & Maraichage", "scope": "International", "source": "CENECA", "url": "https://www.salon-agriculture.com/"},
     {"month": 10, "day": 17, "name": "SIAL Paris (alimentation)", "category": "Salon", "theme": "Agrumes, Fruits rouges & Maraichage", "scope": "International", "source": "Comexposium", "url": "https://www.sialparis.com/"},
     {"month": 10, "day": 4, "name": "Anuga Cologne", "category": "Salon", "theme": "Agrumes, Fruits rouges & Maraichage", "scope": "International", "source": "Koelnmesse", "url": "https://www.anuga.com/"},
-    {"month": 2, "day": 11, "name": "Salon Halieutis Agadir (pêche et aquaculture)", "category": "Salon", "theme": "Agrumes, Fruits rouges & Maraichage", "scope": "Maroc", "source": "Département de la Pêche Maritime", "url": "https://www.salonhalieutis.com/"},
 
     # ───── Élevage ─────
     {"month": 9, "day": 15, "name": "SPACE - Salon élevage Rennes", "category": "Salon", "theme": "Elevage (Ovins, Bovins, Caprins, Volailles)", "scope": "International", "source": "SPACE Organization", "url": "https://www.space.fr/"},
     {"month": 11, "day": 10, "name": "EuroTier Hanovre", "category": "Salon", "theme": "Elevage (Ovins, Bovins, Caprins, Volailles)", "scope": "International", "source": "DLG", "url": "https://www.eurotier.com/"},
     {"month": 10, "day": 6, "name": "Sommet de l'Élevage Clermont-Ferrand", "category": "Salon", "theme": "Elevage (Ovins, Bovins, Caprins, Volailles)", "scope": "International", "source": "GIE Sommet de l'Élevage", "url": "https://www.sommet-elevage.fr/"},
     {"month": 5, "day": 28, "name": "VIV Europe (aviculture)", "category": "Salon", "theme": "Elevage (Ovins, Bovins, Caprins, Volailles)", "scope": "International", "source": "VNU Exhibitions", "url": "https://vivworldwide.com/"},
+
+    # ───── Aquaculture (élevage & transformation) ─────
+    {"month": 2, "day": 11, "name": "Salon Halieutis Agadir (pêche et aquaculture)", "category": "Salon", "theme": "Aquaculture (elevage et transformation)", "scope": "Maroc", "source": "Département de la Pêche Maritime", "url": "https://www.salonhalieutis.com/"},
+    {"month": 4, "day": 27, "name": "Seafood Expo Global Barcelone", "category": "Salon", "theme": "Aquaculture (elevage et transformation)", "scope": "International", "source": "Diversified Communications", "url": "https://www.seafoodexpo.com/global/"},
+    {"month": 9, "day": 22, "name": "Aquaculture Europe (EAS)", "category": "Congrès", "theme": "Aquaculture (elevage et transformation)", "scope": "International", "source": "European Aquaculture Society", "url": "https://www.aquaeas.org/"},
+    {"month": 11, "day": 21, "name": "Journée mondiale de la pêche", "category": "Journée mondiale", "theme": "Aquaculture (elevage et transformation)", "scope": "International", "source": "Nations Unies", "url": "https://www.un.org/"},
 
     # ───── Produits laitiers & Epicerie fine (GMS / retail) ─────
     {"month": 9, "day": 27, "name": "GroceryShop Las Vegas", "category": "Congrès", "theme": "Produits laitiers & Epicerie fine", "scope": "International", "source": "Shoptalk", "url": "https://groceryshop.com/"},
@@ -2560,10 +2548,17 @@ def _render_veille_dashboard(filtered_df, selected_themes, upcoming_events, star
 
 # ─── UI STATE (dark mode + filterbar freeze + vue active) ────────────────────
 if "dark_mode" not in st.session_state:
-    st.session_state["dark_mode"] = False
+    # Restaure la préférence depuis le COOKIE navigateur (persiste entre les
+    # sessions : un user qui a activé le dark mode le retrouve en revenant).
+    # Le cookie est écrit par le bloc JS de synchronisation en fin de script ;
+    # st.context.cookies le lit au chargement. Fallback : mode clair.
+    try:
+        st.session_state["dark_mode"] = st.context.cookies.get("scout_dark") == "1"
+    except Exception:
+        st.session_state["dark_mode"] = False
 if "filterbar_frozen" not in st.session_state:
     st.session_state["filterbar_frozen"] = True
-# Vue active : "veille" (tableau de bord, par defaut) ou "apropos" (page info agent)
+# Vue active : "veille" (tableau de bord, par defaut) ou "apropos" (page Sources)
 if "scout_view" not in st.session_state:
     st.session_state["scout_view"] = "veille"
 
@@ -2577,7 +2572,7 @@ def _toggle_freeze():
 
 
 def _toggle_view():
-    # Bascule entre le tableau de bord Veille et la page À Propos
+    # Bascule entre le tableau de bord Veille et la page Sources
     cur = st.session_state.get("scout_view", "veille")
     st.session_state["scout_view"] = "apropos" if cur == "veille" else "veille"
 
@@ -2599,21 +2594,22 @@ st.markdown(
 )
 
 
-# ─── FILTERBAR (période | thèmes | MàJ | À Propos/Veille DA | dark | freeze) ─
+# ─── FILTERBAR (période | thèmes | MàJ | Sources/Veille DA | dark | freeze) ─
 with st.container(key="filter-row"):
     fb_cols = st.columns([1.6, 5.0, 1.5, 1.2, 0.5, 0.5], gap="small", vertical_alignment="center")
 
     with fb_cols[0]:
         today = date.today()
-        days_ago = today - timedelta(days=5)
+        # today-4 -> plage de 5 jours CALENDAIRES inclus (ex: 31/05 -> 04/06)
+        days_ago = today - timedelta(days=4)
         date_select = st.date_input(
             label="Période",
             value=(days_ago, today),
             max_value=today,
-            min_value=today - timedelta(days=30),
+            min_value=today - timedelta(days=15),
             label_visibility="collapsed",
             format="DD/MM/YYYY",
-            help="Période (max 30 jours, défaut 5 jours)",
+            help="Période (max 15 jours, défaut 5 jours)",
         )
 
     with fb_cols[1]:
@@ -2647,13 +2643,13 @@ with st.container(key="filter-row"):
     with fb_cols[3]:
         # Bouton de navigation : libelle = la vue VERS laquelle on bascule.
         # Cle distincte par etat -> styles CSS differents (contour vs rempli).
-        # Vue "veille" (defaut) -> bouton "À Propos" | Vue "apropos" -> "Veille DA"
+        # Vue "veille" (defaut) -> bouton "Sources" | Vue "apropos" -> "Veille DA"
         _cur_view = st.session_state.get("scout_view", "veille")
         if _cur_view == "veille":
             st.button(
-                "À Propos",
+                "Sources",
                 key="nav_apropos",
-                help="En savoir plus sur l'agent de veille",
+                help="Consulter les sources de référence de la veille",
                 on_click=_toggle_view,
                 width="stretch",
             )
@@ -2690,7 +2686,7 @@ with st.container(key="filter-row"):
 # ─── JS Bridge : griser les dates hors plage dans le calendrier ──────────────
 # BaseWeb/Streamlit ne grise pas visuellement les dates hors [min_value, max_value].
 # Ce script detecte l'ouverture du calendrier via MutationObserver, parse les
-# aria-label de chaque bouton-jour, et grise ceux hors plage (futurs / >30j).
+# aria-label de chaque bouton-jour, et grise ceux hors plage (futurs / >15j).
 components.html(
     f"""
 <script>
@@ -2800,7 +2796,7 @@ components.html(
 
 # ─── CONTENT ──────────────────────────────────────────────────────────────────
 # Vue par defaut = "veille" (tableau de bord actif des l'ouverture, sans toggle).
-# La page "apropos" s'affiche uniquement si l'utilisateur clique sur « À Propos ».
+# La page "apropos" (Sources) s'affiche uniquement via le bouton « Sources ».
 if st.session_state.get("scout_view", "veille") == "veille":
     # Espace haut (masqué en mobile via .st-key-veille-top-spacer)
     with st.container(key="veille-top-spacer"):
@@ -2820,7 +2816,7 @@ if st.session_state.get("scout_view", "veille") == "veille":
     if issues:
         # Landing visuel : grands boutons (1 par thème) avec dégradé de couleur
         # dédié + emoji en filigrane. Au clic, le thème est pré-sélectionné et le
-        # tableau de bord s'affiche. Disposition : 2 centrés en haut, 3 en bas.
+        # tableau de bord s'affiche. Disposition : grille 3 × 2 (6 thèmes).
         # Espace haut (br) masqué en mobile via .st-key-landing-top-spacer (CSS).
         with st.container(key="landing-top-spacer"):
             st.markdown("<br>", unsafe_allow_html=True)
@@ -2854,19 +2850,17 @@ if st.session_state.get("scout_view", "veille") == "veille":
             )
 
         _themes = MEDIA_SCOUT_THEMES
-        # Ligne 1 : 2 boutons centrés (largeur identique à la ligne du bas via spacers)
-        _row1 = st.columns([1, 2, 2, 1], gap="medium")
-        _slots1 = [_row1[1], _row1[2]]
-        for _j in range(min(2, len(_themes))):
-            with _slots1[_j]:
+        # Grille 3 × 2 : 3 boutons par ligne (6 thèmes).
+        _row1 = st.columns(3, gap="medium")
+        for _j in range(min(3, len(_themes))):
+            with _row1[_j]:
                 _render_theme_btn(_themes[_j], _j)
-        # Ligne 2 : les 3 restants
-        _rest = _themes[2:]
+        _rest = _themes[3:]
         if _rest:
             _row2 = st.columns(3, gap="medium")
             for _k, _theme in enumerate(_rest[:3]):
                 with _row2[_k]:
-                    _render_theme_btn(_theme, 2 + _k)
+                    _render_theme_btn(_theme, 3 + _k)
     else:
         with st.spinner("Synthèse des signaux..."):
             media_data_df = data_media_scout(MEDIA_SCOUT_URLS, slot=current_cache_slot())
@@ -2877,7 +2871,7 @@ if st.session_state.get("scout_view", "veille") == "veille":
                 & (media_data_df["Theme"].isin(selected_themes))
             ]
 
-        # Veille Evenementielle : evenements a venir 6 mois a partir de start_date,
+        # Veille Evenementielle : evenements a venir 12 mois a partir de start_date,
         # filtres par les themes selectionnes (catalogue statique journees + salons + congres)
         upcoming_events = _future_events_for_themes(start_date, selected_themes, months=12)
 
@@ -2982,39 +2976,7 @@ if st.session_state.get("scout_view", "veille") == "veille":
             )
 
 else:
-    # ── Page À PROPOS : présentation de l'agent + sources de référence ───────
-    st.markdown("<br>", unsafe_allow_html=True)
-    pres_cols = st.columns(2, gap="medium")
-    with pres_cols[0]:
-        st.markdown(
-            """
-<div class="presentation-card">
-  <div class="eyebrow">Présentation</div>
-  <ul>
-    <li>Aggrégation d'actualités <b>Maroc · UE · monde</b>, organisées en 4 cadres de veille : <b>Réglementaire</b>, <b>Informative</b>, <b>Évènementielle</b>, <b>Concurrentielle</b>.</li>
-    <li>Un <b>Signal du jour</b> : article à fort impact potentiel pour Les Domaines Agricoles.</li>
-    <li><i>Thèmes couverts : Agrumes, Fruits rouges &amp; Tomates cerises · Produits laitiers &amp; Épicerie fine · Élevage (Ovins, Bovins, Caprins, Volailles &amp; Aquaculture) · Environnement, Eau &amp; Énergie · Normes : ESG, QSE &amp; SST.</i></li>
-  </ul>
-</div>
-""",
-            unsafe_allow_html=True,
-        )
-    with pres_cols[1]:
-        st.markdown(
-            """
-<div class="presentation-card">
-  <div class="eyebrow">Utiliser l'Agent</div>
-  <ol>
-    <li>Cliquer sur <b>« Veille DA »</b> pour revenir au tableau de bord</li>
-    <li>Sélectionner la <b>période</b> souhaitée (max 30 jours)</li>
-    <li>Choisir le <b>thème</b> à couvrir (un seul à la fois)</li>
-    <li>Les actualités s'affichent <b>automatiquement</b> — cliquer sur <b>Voir tout</b> d'un cadre pour explorer les articles</li>
-  </ol>
-</div>
-""",
-            unsafe_allow_html=True,
-        )
-
+    # ── Page SOURCES : catalogue des sources de référence de la veille ───────
     df_urls = pd.DataFrame(MEDIA_SCOUT_SOURCE_CATALOG)
     # Retire les codes internes d'organisation (C1, A2, T4…) en tête de "Couverture"
     # — utiles côté maintenance mais déroutants pour l'utilisateur final.
@@ -3100,24 +3062,50 @@ else:
             width="stretch",
         )
 
-    st.dataframe(
-        df_urls.style.format(na_rep="No Data", precision=0),
-        column_config={
-            "Origine": st.column_config.TextColumn("Origine", width="small"),
-            "Thème": st.column_config.TextColumn("Thème", width="medium"),
-            "Zone": st.column_config.TextColumn("Zone", width="small"),
-            "Couverture": st.column_config.TextColumn("Couverture", width="large"),
-            "URL": st.column_config.LinkColumn(
-                "URL",
-                validate=r"^https?://.*$",
-                max_chars=100,
-                display_text="Ouvrir",
-            ),
-        },
-        hide_index=True,
-        width="stretch",
-    )
+    # Table HTML custom : suit la palette light/dark (le canvas de st.dataframe
+    # ignore nos variables CSS et restait clair en dark mode) + largeur elargie
+    # via la regle :has(.st-key-sources-table) du CSS.
+    df_show = df_urls.fillna("—")
+    _trs = []
+    for _, r in df_show.iterrows():
+        _url = str(r["URL"]).strip()
+        _link = (
+            f'<a class="src-link" href="{escape(_url, quote=True)}" target="_blank" '
+            f'rel="noopener">Ouvrir →</a>'
+            if _url.startswith("http") else "—"
+        )
+        _trs.append(
+            "<tr>"
+            f'<td class="src-name">{escape(str(r["Journal"]))}</td>'
+            f'<td class="src-nowrap">{escape(str(r["Origine"]))}</td>'
+            f'<td>{escape(str(r["Thème"]))}</td>'
+            f'<td class="src-nowrap">{escape(str(r["Zone"]))}</td>'
+            f'<td>{escape(str(r["Couverture"]))}</td>'
+            f"<td>{_link}</td>"
+            "</tr>"
+        )
+    with st.container(key="sources-table"):
+        st.markdown(
+            '<div class="sources-table-wrap"><table class="sources-table">'
+            "<thead><tr><th>Journal</th><th>Origine</th><th>Thème</th><th>Zone</th>"
+            "<th>Couverture</th><th>URL</th></tr></thead><tbody>"
+            + "".join(_trs)
+            + "</tbody></table></div>",
+            unsafe_allow_html=True,
+        )
 
 
 # ─── Bottom spacing (2 empty rows at end of page) ─────────────────────────────
 st.markdown('<div style="height:80px"></div>', unsafe_allow_html=True)
+
+# ─── Persistance du dark mode (cookie navigateur, durée 1 an) ─────────────────
+# Écriture : l'iframe des components est same-origin (Streamlit Cloud inclus)
+# -> on pose le cookie sur le document parent à chaque rerun (idempotent).
+# Lecture : st.context.cookies à l'initialisation de session (cf. UI STATE).
+_dark_flag = "1" if st.session_state.get("dark_mode", False) else "0"
+components.html(
+    "<script>try{window.parent.document.cookie="
+    f"'scout_dark={_dark_flag}; max-age=31536000; path=/; SameSite=Lax';"
+    "}catch(e){}</script>",
+    height=0,
+)
