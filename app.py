@@ -518,19 +518,25 @@ div[data-testid="stAppViewContainer"] main .block-container{
    BaseWeb + la listbox + chaque option sont peints en blanc par le thème
    Streamlit statique -> on les rebase sur la palette (suit le dark mode).
    Scope :has([role="listbox"]) pour ne pas toucher le calendrier du date input. */
-[data-baseweb="popover"]:has([role="listbox"]) > div{
+/* NB : l'UL du dropdown Streamlit ne porte PAS role="listbox" (seulement
+   data-testid) -> le :has() doit couvrir les deux signatures. */
+[data-baseweb="popover"]:has([role="listbox"]) > div,
+[data-baseweb="popover"]:has([data-testid="stSelectboxVirtualDropdown"]) > div{
     background:var(--paper-2) !important;
     border:1px solid var(--line-strong) !important;
+    transition:none !important;
 }
 [data-baseweb="popover"] [role="listbox"],
 ul[data-testid="stSelectboxVirtualDropdown"],
 [data-baseweb="menu"]{
     background:var(--paper-2) !important;
+    transition:none !important;
 }
 [data-baseweb="popover"] [role="option"],
 [data-baseweb="menu"] [role="option"]{
     background:var(--paper-2) !important;
     color:var(--ink) !important;
+    transition:none !important;
 }
 [data-baseweb="popover"] [role="option"]:hover,
 [data-baseweb="popover"] [role="option"][aria-selected="true"],
@@ -588,6 +594,11 @@ ul[data-testid="stSelectboxVirtualDropdown"],
 .st-key-con_pcat_filter [data-baseweb="select"] > div{
     background:var(--select-fill) !important;
     border-color:var(--line-strong) !important;
+    /* transition:none INDISPENSABLE : BaseWeb relance sa transition
+       background-color en boucle (running@0ms perpetuel) -> l'ecran reste fige
+       sur la couleur de DEPART (beige du theme statique) et nos regles,
+       pourtant gagnantes en cascade, ne s'affichent jamais. */
+    transition:none !important;
 }
 .st-key-filter-row [data-baseweb="select"] svg,
 .st-key-con_ptype_filter [data-baseweb="select"] svg,

@@ -2425,8 +2425,8 @@ _TAXONOMY_VERSION = "v35"
 def current_cache_slot() -> str:
     """Retourne un identifiant de creneau qui change aux heures programmees.
 
-    Ex : entre 07h00 et 18h59 -> 'YYYY-MM-DD-07h-v3'
-         entre 19h00 et 06h59 -> 'YYYY-MM-DD-19h-v3'
+    Ex : entre 07h00 et 18h59 -> 'YYYY-MM-DD-07h-<version>'
+         entre 19h00 et 06h59 -> 'YYYY-MM-DD-19h-<version>'
 
     Utilise comme parametre de cache de data_media_scout : quand le creneau OU la
     version de taxonomie change, la cle de cache change -> Streamlit re-execute
@@ -3284,7 +3284,17 @@ def compute_signal_du_jour(articles_context: tuple) -> dict:
             headline_fr = (translate_titles_to_french((headline_raw,))[0] or "").strip()
             if not _looks_french(headline_fr):
                 headline_fr = _force_french_translate(headline_fr, kind="titre")
-        if not headline_fr or not _looks_french(headline_fr):
+        # Garde STRICTE (preuve positive de francais) : _looks_french est neutre
+        # sur un titre EN sans stopwords courants ("Investor climate group closes
+        # down...") -> ici, derniere ligne de defense avant affichage, on exige
+        # un diacritique OU un stopword FR, sinon titre generique francais.
+        def _french_evidence(t: str) -> bool:
+            raw = (t or "").lower()
+            if any(c in raw for c in "éèêëàâäîïôöùûüÿœæç"):
+                return True
+            padded = " " + raw + " "
+            return any(m in padded for m in _FR_STRONG_TOKENS)
+        if not headline_fr or not _looks_french(headline_fr) or not _french_evidence(headline_fr):
             headline_fr = f"Signal de veille — {source}" if source else "Signal de veille du jour"
         headline_fr = headline_fr[:160]
 
