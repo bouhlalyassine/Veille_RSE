@@ -29,3 +29,4 @@ exports/
 cache/
 Other_Scripts/
 .claude
+tests

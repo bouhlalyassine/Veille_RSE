@@ -1,5 +1,6 @@
 import html
 import json
+import logging
 import os
 import re
 import unicodedata
@@ -8,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
 from functools import lru_cache
-from pathlib import Path
+from threading import BoundedSemaphore, Event, RLock, Thread
 from types import SimpleNamespace
 from urllib.parse import urljoin, urlparse
 from xml.etree import ElementTree
@@ -34,17 +35,6 @@ try:
     warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
 except ImportError:
     pass
-
-
-current_dir = Path(__file__).parent if "__file__" in locals() else Path.cwd()
-css_file = current_dir / "main.css"
-
-
-def load_css():
-    if css_file.exists():
-        with open(css_file, encoding="utf-8") as f:
-            st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
-
 
 
 MEDIA_SCOUT_THEMES = [
@@ -1382,7 +1372,7 @@ def _fetch_media_url(url):
         return None
 
 
-def _is_media_feed(url, response):
+def _is_media_feed(response):
     content_type = response.headers.get("Content-Type", "").lower()
     sample = response.text[:200].lstrip().lower()
     return "xml" in content_type or "rss" in content_type or sample.startswith(("<?xml", "<rss", "<feed"))
@@ -1490,7 +1480,11 @@ def _extract_html_articles(soup, source_url):
             if id(card) in seen_nodes:
                 continue
             seen_nodes.add(id(card))
-            title_node = card.find(["h1", "h2", "h3", "h4"])
+            titles = card.find_all(["h1", "h2", "h3", "h4"])
+            # Un conteneur de plusieurs actualites ne constitue pas un article.
+            if len(titles) > 1:
+                continue
+            title_node = titles[0] if titles else None
             link_node = title_node.find("a", href=True) if title_node else None
             link_node = link_node or card.find("a", href=True)
             if not link_node:
@@ -1521,14 +1515,14 @@ def _scrape_media_source(source_url):
     response = _fetch_media_url(source_url)
     if response is None:
         return []
-    if _is_media_feed(source_url, response):
+    if _is_media_feed(response):
         return _extract_feed_articles(response, source_url)
 
     soup = BeautifulSoup(response.text, "html.parser")
     articles = _extract_html_articles(soup, source_url)
     for feed_url in _discover_feed_urls(soup, source_url):
         feed_response = _fetch_media_url(feed_url)
-        if feed_response is not None and _is_media_feed(feed_url, feed_response):
+        if feed_response is not None and _is_media_feed(feed_response):
             articles.extend(_extract_feed_articles(feed_response, source_url))
     return articles
 
@@ -2411,7 +2405,7 @@ MEDIA_SCOUT_MAX_AGE_DAYS = 15
 try:
     _TZ_MAROC = ZoneInfo("Africa/Casablanca")
 except Exception:
-    # Fallback Windows sans tzdata : UTC+1 fixe (Maroc reste sur UTC+1 toute l'annee)
+    # Fallback pour un environnement sans la base de fuseaux ; tzdata est requis.
     from datetime import timezone
     _TZ_MAROC = timezone(timedelta(hours=1), name="Africa/Casablanca")
 
@@ -2419,10 +2413,10 @@ except Exception:
 # Bumper cette version a chaque modification de la taxonomie (themes, keywords, sources).
 # Inclus dans le slot de cache -> invalide automatiquement le DataFrame en cache et
 # force un re-scraping a la prochaine execution.
-_TAXONOMY_VERSION = "v35"
+_TAXONOMY_VERSION = "v38"
 
 
-def current_cache_slot() -> str:
+def current_cache_slot(now=None) -> str:
     """Retourne un identifiant de creneau qui change aux heures programmees.
 
     Ex : entre 07h00 et 18h59 -> 'YYYY-MM-DD-07h-<version>'
@@ -2432,7 +2426,7 @@ def current_cache_slot() -> str:
     version de taxonomie change, la cle de cache change -> Streamlit re-execute
     la fonction -> nouveau scraping + re-classification.
     """
-    now = _datetime_maroc()
+    now = (now or _datetime_maroc()).astimezone(_TZ_MAROC)
     hour = now.hour
     passed_hours = [h for h in SCHEDULED_REFRESH_HOURS if hour >= h]
     if passed_hours:
@@ -2450,18 +2444,49 @@ def _datetime_maroc() -> datetime:
     return datetime.now(_TZ_MAROC)
 
 
-@st.cache_data(show_spinner=False, persist="disk")  # cle = slot (meme que data_media_scout)
 def media_scrape_timestamp(slot: str = "") -> datetime:
-    """Horodatage reel de la derniere collecte de donnees (heure Maroc).
+    """Lit l'heure de fin de collecte dans le resultat, y compris apres un reboot."""
+    return data_media_scout(slot=slot or current_cache_slot()).attrs.get("collected_at")
 
-    Mise en cache par 'slot' (meme cle que data_media_scout) : la valeur est
-    figee au PREMIER acces de chaque creneau — c.-a-d. au moment ou le scraping
-    reel se produit — puis reutilisee jusqu'au prochain creneau. Reflete donc
-    fidelement la derniere mise a jour effective des donnees affichees.
 
-    A appeler avec le meme slot que data_media_scout : current_cache_slot().
-    """
-    return _datetime_maroc()
+def next_refresh_time(now=None):
+    """Prochaine echeance en heure Casablanca, avec les transitions de fuseau."""
+    now = (now or _datetime_maroc()).astimezone(_TZ_MAROC)
+    for day_offset in (0, 1):
+        for hour in sorted(SCHEDULED_REFRESH_HOURS):
+            target = (now + timedelta(days=day_offset)).replace(
+                hour=hour, minute=0, second=0, microsecond=0,
+            )
+            if target > now:
+                return target
+
+
+def _scheduled_refresh_loop(stop_event):
+    while not stop_event.is_set():
+        now = _datetime_maroc()
+        delay = next_refresh_time(now).timestamp() - now.timestamp()
+        if stop_event.wait(max(0, delay)):
+            return
+        for attempt in range(3):
+            try:
+                data_media_scout(slot=current_cache_slot())
+                break
+            except Exception as exc:
+                logging.getLogger(__name__).warning(
+                    "Scheduled collection failed (%s), attempt %s", type(exc).__name__, attempt + 1,
+                )
+                if stop_event.wait(60):
+                    return
+
+
+@st.cache_resource(show_spinner=False)
+def start_scout_refresh_scheduler():
+    """Un seul ordonnanceur par process ; le serveur doit rester actif."""
+    stop_event = Event()
+    thread = Thread(target=_scheduled_refresh_loop, args=(stop_event,), daemon=True,
+                    name="scout-refresh")
+    thread.start()
+    return stop_event
 
 
 def format_last_update(dt: datetime) -> str:
@@ -2471,15 +2496,16 @@ def format_last_update(dt: datetime) -> str:
     return dt.strftime("%d/%m/%Y · %Hh%M")
 
 
-@st.cache_data(show_spinner=False, persist="disk")  # TTL pilote par slot (cf. current_cache_slot)
+@st.cache_data(show_spinner=False, persist="disk", max_entries=4)
 def data_media_scout(urls=None, slot: str = ""):
-    """Scraping global. La param 'slot' fait partie de la cle de cache : son
-    changement (declenche a 07h00 / 19h00) force un re-scraping. Le slot a
-    passer est current_cache_slot() — fournit par l'app au moment de l'appel.
+    """Resultat partage par creneau, avec l'horodatage reel de fin de collecte."""
+    df = _collect_media_scout(urls)
+    df.attrs["collected_at"] = _datetime_maroc()
+    return df
 
-    persist="disk" : le resultat est aussi ecrit sur disque -> si le conteneur
-    Streamlit Cloud redemarre (reveil apres mise en veille, reboot), le cache du
-    creneau courant est recharge instantanement au lieu de re-scraper."""
+
+def _collect_media_scout(urls=None):
+    """Collecte, filtre puis enrichit les articles utiles au tableau de bord."""
     urls = urls or MEDIA_SCOUT_URLS
     source_urls = [source["URL"] if isinstance(source, dict) else source for source in urls]
 
@@ -2528,16 +2554,6 @@ def data_media_scout(urls=None, slot: str = ""):
         empty_df["Date"] = pd.to_datetime(empty_df["Date"])
         return empty_df
 
-    # ── Validation LLM par theme : juge si le titre est strictement lie au theme ──
-    # Cette couche capture les articles qui matchent les keywords mais sont en realite
-    # off-topic. Erreur safe : si LLM echoue, on garde tout (pas de perte de donnees).
-    df = _llm_validate_themes(df)
-
-    if df.empty:
-        empty_df = pd.DataFrame(columns=columns)
-        empty_df["Date"] = pd.to_datetime(empty_df["Date"])
-        return empty_df
-
     df["Veille"] = df.apply(_assign_media_veille, axis=1)
 
     # Filtre post-classification : pertinence Maroc (zone MAROC, marqueur Maroc
@@ -2554,6 +2570,9 @@ def data_media_scout(urls=None, slot: str = ""):
     df = df.drop_duplicates(subset=["_link_key"])
     df = df.drop_duplicates(subset=["_title_key"])
     df = df.drop(columns=["_title_key", "_link_key"])
+
+    # Les doublons et articles hors perimetre ne consomment aucun appel LLM.
+    df = _llm_validate_themes(df)
 
     # Traduction FR des articles non-francophones (sources institutionnelles EN :
     # EFSA, DairyReporter, Climate Home, etc.). ~4% des articles. Batched + cache
@@ -2577,19 +2596,20 @@ def data_media_scout(urls=None, slot: str = ""):
 #   - _LLM_EXHAUSTED : dict global { secret_name -> datetime cooldown_end }
 #   - _llm_chat_with_failover() : interface unifiee retournant un objet
 #       OpenAI-compatible (response.choices[0].message.content)
-#   - _groq_chat_with_failover : alias retro-compat -> _llm_chat_with_failover
 
 # Ordre de priorite : Google d'abord (free tier plus genereux), Groq en backup
 _LLM_PROVIDERS = (
-    ("google", "GOOGLE_API_KEY",   "gemini-3.5-flash"),
-    ("google", "GOOGLE_API_KEY_1", "gemini-3.5-flash"),
-    ("groq",   "GROQ_API_KEY",     "llama-3.3-70b-versatile"),
-    ("groq",   "GROQ_API_KEY_1",   "llama-3.3-70b-versatile"),
+    ("google", "GOOGLE_API_KEY",   "gemini-3.5-flash-lite"),
+    ("google", "GOOGLE_API_KEY_1", "gemini-3.5-flash-lite"),
+    ("groq",   "GROQ_API_KEY",     "openai/gpt-oss-120b"),
+    ("groq",   "GROQ_API_KEY_1",   "openai/gpt-oss-120b"),
 )
 
 # Module-level dict (partage entre toutes les sessions Streamlit du process)
 # secret_name -> datetime jusqu'auquel la cle est marquee comme epuisee
 _LLM_EXHAUSTED = {}
+_LLM_STATE_LOCK = RLock()
+_LLM_REQUEST_LIMIT = BoundedSemaphore(2)
 
 
 def _get_secret_or_env(name: str):
@@ -2627,17 +2647,20 @@ def _has_any_llm_key() -> bool:
 
 def _is_key_available(secret_name: str) -> bool:
     """True si la cle n'est pas marquee comme epuisee (ou si cooldown expire)."""
-    if secret_name not in _LLM_EXHAUSTED:
-        return True
-    if datetime.now() >= _LLM_EXHAUSTED[secret_name]:
-        del _LLM_EXHAUSTED[secret_name]
-        return True
-    return False
+    with _LLM_STATE_LOCK:
+        until = _LLM_EXHAUSTED.get(secret_name)
+        if until is None:
+            return True
+        if datetime.now() >= until:
+            del _LLM_EXHAUSTED[secret_name]
+            return True
+        return False
 
 
 def _mark_key_exhausted(secret_name: str, cooldown_seconds: int = 60):
     """Marque une cle comme epuisee pendant `cooldown_seconds` (defaut 60s)."""
-    _LLM_EXHAUSTED[secret_name] = datetime.now() + timedelta(seconds=cooldown_seconds)
+    with _LLM_STATE_LOCK:
+        _LLM_EXHAUSTED[secret_name] = datetime.now() + timedelta(seconds=cooldown_seconds)
 
 
 def _wrap_llm_response(content: str):
@@ -2668,16 +2691,37 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     )
 
 
+@lru_cache(maxsize=8)
+def _groq_client(api_key):
+    return Groq(api_key=api_key, timeout=25, max_retries=0)
+
+
+@lru_cache(maxsize=8)
+def _gemini_client(api_key):
+    return _genai.Client(api_key=api_key, http_options={"timeout": 25000,
+                        "retry_options": {"attempts": 1}})
+
+
 def _call_groq_provider(api_key, model, messages, max_tokens, temperature, **kwargs):
     """Appel Groq retournant un objet OpenAI-compatible."""
-    client = Groq(api_key=api_key)
-    return client.chat.completions.create(
+    client = _groq_client(api_key)
+    # Le budget inclut les tokens de raisonnement de GPT-OSS.
+    kwargs.setdefault("reasoning_effort", "low")
+    schema = kwargs.pop("response_schema", None)
+    if schema:
+        kwargs["response_format"] = {"type": "json_schema", "json_schema": {
+            "name": "scout_response", "schema": schema, "strict": True,
+        }}
+    response = client.chat.completions.create(
         model=model,
         messages=messages,
-        max_tokens=max_tokens,
+        max_completion_tokens=max_tokens + 1024,
         temperature=temperature,
         **kwargs,
     )
+    if response.choices[0].finish_reason == "length":
+        raise ValueError("Groq response truncated")
+    return response
 
 
 def _call_gemini_provider(api_key, model, messages, max_tokens, temperature, **kwargs):
@@ -2693,7 +2737,7 @@ def _call_gemini_provider(api_key, model, messages, max_tokens, temperature, **k
     if not _GENAI_AVAILABLE:
         raise RuntimeError("google-genai non installe")
 
-    client = _genai.Client(api_key=api_key)
+    client = _gemini_client(api_key)
 
     # Separe system prompt (concat de tous les role=system) du reste
     system_parts = []
@@ -2714,7 +2758,12 @@ def _call_gemini_provider(api_key, model, messages, max_tokens, temperature, **k
     config_kwargs = {
         "temperature": float(temperature) if temperature is not None else 0.4,
         "max_output_tokens": int(max_tokens) if max_tokens else 500,
+        "thinking_config": {"thinking_level": "minimal"},
     }
+    if kwargs.get("response_format", {}).get("type") == "json_object":
+        config_kwargs["response_mime_type"] = "application/json"
+    if kwargs.get("response_schema"):
+        config_kwargs["response_json_schema"] = kwargs["response_schema"]
     if system_instruction:
         config_kwargs["system_instruction"] = system_instruction
 
@@ -2739,6 +2788,9 @@ def _call_gemini_provider(api_key, model, messages, max_tokens, temperature, **k
             config=config,
         )
 
+    if resp.candidates and str(resp.candidates[0].finish_reason).endswith("MAX_TOKENS"):
+        raise ValueError("Gemini response truncated")
+
     # Extraction robuste du texte (resp.text peut etre vide / lever si bloque)
     text = ""
     try:
@@ -2755,18 +2807,14 @@ def _call_gemini_provider(api_key, model, messages, max_tokens, temperature, **k
     return _wrap_llm_response(text)
 
 
-def _llm_chat_with_failover(messages, model=None, max_tokens=500,
-                            temperature=0.4, **kwargs):
+def _dispatch_llm_chat(messages, max_tokens=500, temperature=0.4, **kwargs):
     """Appel chat completion avec basculement automatique entre providers/cles.
 
-    Ordre tente : Google Gemini (cles 1 & 2) puis Groq llama (cles 1 & 2).
+    Ordre tente : Google Gemini (cles 1 & 2) puis Groq GPT-OSS (cles 1 & 2).
     Sur rate limit (429 / quota / resource_exhausted), marque la cle epuisee
     pendant 60s et passe a la suivante. Sur erreur non-rate-limit (auth, model
     inconnu, etc.), passe quand meme a la suivante mais memorise l'erreur pour
     diagnostic (un provider invalide ne doit pas bloquer les autres).
-
-    Note : l'argument `model` est ignore (chaque entree _LLM_PROVIDERS a son
-    propre modele par defaut). Garde pour retro-compat avec les call sites.
 
     Returns: objet OpenAI-compatible avec response.choices[0].message.content.
     Raises: RuntimeError si aucun provider n'est configure ou si tous echouent.
@@ -2779,31 +2827,37 @@ def _llm_chat_with_failover(messages, model=None, max_tokens=500,
         )
 
     last_error = None
-    tried = 0
     for provider, secret_name, default_model, api_key in available:
         if not _is_key_available(secret_name):
             continue
-        tried += 1
         try:
-            if provider == "google":
-                return _call_gemini_provider(
-                    api_key, default_model, messages,
-                    max_tokens, temperature, **kwargs,
-                )
-            else:  # groq
-                return _call_groq_provider(
-                    api_key, default_model, messages,
-                    max_tokens, temperature, **kwargs,
-                )
+            with _LLM_REQUEST_LIMIT:
+                if not _is_key_available(secret_name):
+                    continue
+                call = _call_gemini_provider if provider == "google" else _call_groq_provider
+                response = call(api_key, default_model, messages,
+                                max_tokens, temperature, **kwargs)
+                content = response.choices[0].message.content
+                if not content or not content.strip():
+                    raise ValueError("Empty LLM response")
+                if kwargs.get("response_format", {}).get("type") == "json_object":
+                    if not isinstance(json.loads(content), dict):
+                        raise ValueError("Expected a JSON object")
+                return response
         except Exception as exc:
             last_error = exc
+            status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
             if _is_rate_limit_error(exc):
                 _mark_key_exhausted(secret_name, cooldown_seconds=60)
+            elif status in (400, 401, 403, 404):
+                _mark_key_exhausted(secret_name, cooldown_seconds=3600)
             else:
-                # Erreur non-rate-limit : cooldown plus court (5s) pour eviter
+                # Erreur non-rate-limit : cooldown plus court pour eviter
                 # de marteler une cle cassee, mais sans bloquer trop longtemps
                 # au cas ou ce serait transitoire (network).
-                _mark_key_exhausted(secret_name, cooldown_seconds=5)
+                _mark_key_exhausted(secret_name, cooldown_seconds=15)
+            logging.getLogger(__name__).warning("LLM %s failed: %s (status %s)",
+                                                secret_name, type(exc).__name__, status)
             continue  # essaie le prochain provider/cle
 
     if last_error:
@@ -2814,22 +2868,35 @@ def _llm_chat_with_failover(messages, model=None, max_tokens=500,
     )
 
 
-# Alias retro-compat : ancien nom utilise par les call sites existants
-_groq_chat_with_failover = _llm_chat_with_failover
+@st.cache_data(ttl=43200, max_entries=2048, show_spinner=False)
+def _cached_llm_content(messages_json, max_tokens, temperature, options_json, provider_models):
+    """Les modeles font partie de la cle pour invalider le cache lors d'une migration."""
+    response = _dispatch_llm_chat(json.loads(messages_json), max_tokens, temperature,
+                                  **json.loads(options_json))
+    return response.choices[0].message.content
+
+
+def _llm_chat_with_failover(messages, max_tokens=500, temperature=0.4, **kwargs):
+    """Cache les reponses reussies par contenu et configuration, jamais les erreurs."""
+    content = _cached_llm_content(
+        json.dumps(messages, ensure_ascii=False, sort_keys=True), max_tokens, temperature,
+        json.dumps(kwargs, sort_keys=True), _LLM_PROVIDERS,
+    )
+    return _wrap_llm_response(content)
 
 
 # ─── Couche de validation LLM (qualite thematique) ────────────────────────────
 # Apres l'assignation par keywords, le LLM scan les titres et juge si chaque
 # article est REELLEMENT lie au theme assigne. Permet de retirer le bruit
 # residuel (articles qui matchent les keywords mais sont off-topic en realite).
-# Appel batch par theme (jusqu'a 25 titres par requete). Cache via @st.cache_data
+# Appel batch par theme (jusqu'a 40 titres par requete). Cache via @st.cache_data
 # de data_media_scout (slot-based), donc ne s'execute que 2x/jour.
 
-_LLM_VALIDATE_CHUNK_SIZE = 25  # nb max d'articles par batch LLM (token budget)
+_LLM_VALIDATE_CHUNK_SIZE = 40  # titres courts, sortie = liste d'indices
 # Nb d'appels LLM simultanes (validation + traduction). Modere volontairement :
-# assez pour diviser le temps de refresh par ~4, sans saturer les rate limits
+# assez pour accelerer le refresh sans saturer les rate limits
 # free tier (le failover multi-cles absorbe les 429 residuels).
-_LLM_PARALLEL_WORKERS = 4
+_LLM_PARALLEL_WORKERS = 2
 
 
 def _llm_validate_chunk(items: list, theme_label: str) -> set:
@@ -2873,11 +2940,14 @@ def _llm_validate_chunk(items: list, theme_label: str) -> set:
     )
 
     try:
-        response = _groq_chat_with_failover(
+        response = _llm_chat_with_failover(
             messages=[{"role": "user", "content": prompt}],
-            model="llama-3.3-70b-versatile",
             max_tokens=400,
             temperature=0.1,
+            response_format={"type": "json_object"},
+            response_schema={"type": "object", "properties": {
+                "relevant": {"type": "array", "items": {"type": "integer"}},
+            }, "required": ["relevant"], "additionalProperties": False},
         )
         raw = response.choices[0].message.content.strip()
         if raw.startswith("```"):
@@ -2887,7 +2957,9 @@ def _llm_validate_chunk(items: list, theme_label: str) -> set:
         if m:
             raw = m.group(0)
         data = json.loads(raw)
-        relevant_ids = data.get("relevant", [])
+        relevant_ids = data.get("relevant")
+        if not isinstance(relevant_ids, list):
+            raise ValueError("Missing relevant article indices")
 
         # Mappe les indices locaux [0..N-1] vers les df_index
         valid = set()
@@ -2989,6 +3061,8 @@ _EN_STRONG_TOKENS = (
     " upon ", " about ", " over ", " under ", " above ", " below ",
     " when ", " where ", " while ", " because ", " although ",
     " an ", " any ", " all ", " new ", " more ", " less ",
+    " sales ", " earnings ", " launches ", " prices ", " rises ", " falls ",
+    " increases ", " growth ", " take ", " hit ", " but ",
 )
 
 
@@ -2996,12 +3070,11 @@ def _looks_french(text: str) -> bool:
     """Detecte si le texte est predominantely en francais.
 
     Heuristique : compare le nombre de tokens FR vs EN distinctifs +
-    presence de diacritics francais (é/è/ê/à/ç/...). Texte court (<35 chars)
-    -> True par defaut (titre).
+    presence de diacritics francais (é/è/ê/à/ç/...), y compris les titres courts.
     """
-    if not text or len(text.strip()) < 35:
+    if not text or not text.strip():
         return True
-    raw = text.lower()
+    raw = text.lower().replace("’", "'")
     # Bonus important si presence de diacritics francais (signature claire FR)
     has_diacritics = any(c in raw for c in "éèêëàâäîïôöùûüÿœæç")
     padded = " " + raw + " "
@@ -3061,7 +3134,6 @@ def _force_french_translate(text: str, kind: str = "phrase") -> str:
     return text
 
 
-@st.cache_data(ttl=43200, show_spinner=False)
 def translate_titles_to_french(titles: tuple) -> tuple:
     """Traduit en francais une petite liste de titres (saute ceux deja FR).
 
@@ -3140,6 +3212,14 @@ def _translate_articles_to_french(df):
                 ],
                 max_tokens=1800,
                 temperature=0.2,
+                response_format={"type": "json_object"},
+                response_schema={"type": "object", "properties": {
+                    "articles": {"type": "array", "items": {"type": "object",
+                        "properties": {"i": {"type": "integer"},
+                                       "titre": {"type": "string"},
+                                       "resume": {"type": "string"}},
+                        "required": ["i", "titre", "resume"], "additionalProperties": False}},
+                }, "required": ["articles"], "additionalProperties": False},
             )
             raw = (resp.choices[0].message.content or "").strip()
             if raw.startswith("```"):
@@ -3185,7 +3265,6 @@ def _translate_articles_to_french(df):
     return df
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
 def compute_signal_du_jour(articles_context: tuple) -> dict:
     """Identifie le 'Signal du jour' : l'article le plus critique a mettre en alerte forte.
 
@@ -3216,7 +3295,24 @@ def compute_signal_du_jour(articles_context: tuple) -> dict:
         if m:
             allowed_urls.add(m.group(1).strip())
 
-    articles_text = "\n".join(f"- {a}" for a in articles_context[:25])
+    def _parse_article_fields(article_str: str) -> dict:
+        fields = {}
+        for part in article_str.split(" | "):
+            if ":" in part:
+                key, val = part.split(":", 1)
+                fields[key.strip().lower()] = val.strip()
+        return fields
+
+    candidates = [_parse_article_fields(a) for a in articles_context[:25]]
+    # Les longues URLs Google News restent locales ; le LLM choisit un indice.
+    articles_text = "\n".join(
+        f"[{i}] " + " | ".join(
+            f"{field}: {article.get(field, '')[:limit]}"
+            for field, limit in (("titre", 200), ("source", 80), ("date", 30),
+                                 ("theme", 100), ("veille", 40), ("resume", 450))
+        )
+        for i, article in enumerate(candidates)
+    )
 
     prompt = (
         "[LANGUE DE SORTIE = FRANCAIS UNIQUEMENT — instruction non-negociable] "
@@ -3240,6 +3336,11 @@ def compute_signal_du_jour(articles_context: tuple) -> dict:
         "  4. Innovation technologique pertinente pour la filiere agro\n"
         "  5. A defaut, l'article LE PLUS RECENT du corpus\n\n"
         "Le BODY (3 a 4 phrases, 55-75 mots, EN FRANCAIS) :\n"
+        "  - N'invente aucun acteur, chiffre, date ou obligation absent des articles fournis\n"
+        "  - Une conference ou une annonce scientifique n'est pas une nouvelle "
+        "reglementation : n'annonce aucune evolution reglementaire sans texte explicite\n"
+        "  - Distingue les faits rapportes des consequences possibles pour LDA ; "
+        "formule ces consequences au conditionnel, sans annoncer une action du groupe\n"
         "  - Decris d'abord ce qui se passe (acteur / decision / chiffre cle / date)\n"
         "  - Explique EXPLICITEMENT le mecanisme d'impact sur LDA (production vegetale, "
         "elevage, transformation, exports, supply chain, conformite QSE)\n"
@@ -3252,17 +3353,9 @@ def compute_signal_du_jour(articles_context: tuple) -> dict:
         '{"eyebrow":"<Veille · Zone, EN FRANCAIS>",'
         '"headline":"<titre 10-14 mots EN FRANCAIS, oriente impact>",'
         '"body":"<3 a 4 phrases EN FRANCAIS, texte continu fluide, 55-75 mots>",'
-        '"source_url":"<URL EXACTE choisie dans la liste fournie>"}'
+        '"source_index":<indice entier de l\'article choisi>}'
     )
     # Fallback : prend le 1er article du corpus et tente une traduction LLM en francais
-    def _parse_article_fields(article_str: str) -> dict:
-        fields = {}
-        for part in article_str.split(" | "):
-            if ":" in part:
-                key, val = part.split(":", 1)
-                fields[key.strip().lower()] = val.strip()
-        return fields
-
     def _build_fallback_signal():
         """Signal de repli (LLM principal en echec) avec FRANCAIS GARANTI :
         titre via le traducteur cache + garde-fou _looks_french, et a defaut une
@@ -3321,7 +3414,7 @@ def compute_signal_du_jour(articles_context: tuple) -> dict:
         }
 
     try:
-        response = _groq_chat_with_failover(
+        response = _llm_chat_with_failover(
             messages=[
                 {
                     "role": "system",
@@ -3336,9 +3429,14 @@ def compute_signal_du_jour(articles_context: tuple) -> dict:
                 },
                 {"role": "user", "content": prompt},
             ],
-            model="llama-3.3-70b-versatile",
-            max_tokens=500,
+            max_tokens=900,
             temperature=0.4,
+            response_format={"type": "json_object"},
+            response_schema={"type": "object", "properties": {
+                "eyebrow": {"type": "string"}, "headline": {"type": "string"},
+                "body": {"type": "string"}, "source_index": {"type": "integer"},
+            }, "required": ["eyebrow", "headline", "body", "source_index"],
+                "additionalProperties": False},
         )
         raw = response.choices[0].message.content.strip()
         # Strip markdown code fences if present
@@ -3363,7 +3461,10 @@ def compute_signal_du_jour(articles_context: tuple) -> dict:
             body = _force_french_translate(body, kind="phrase")
         if eyebrow and not _looks_french(eyebrow):
             eyebrow = _force_french_translate(eyebrow, kind="titre")
-        url = str(parsed.get("source_url", "")).strip()
+        source_index = parsed.get("source_index")
+        if type(source_index) is not int or not 0 <= source_index < len(candidates):
+            return _build_fallback_signal()
+        url = candidates[source_index].get("lien", "")
         # Validation : l'URL doit etre dans la liste passee (anti-hallucination)
         if url and url not in allowed_urls:
             url = ""

@@ -1,8 +1,3 @@
-#  .venv/Scripts/Activate.ps1
-#  python -m streamlit run app.py
-#  git add .    # git commit -m "Màj"   # git push -u origin master
-
-
 import unicodedata
 from datetime import date, timedelta
 from html import escape
@@ -13,7 +8,6 @@ import streamlit.components.v1 as components
 
 from Settings import (
     MEDIA_SCOUT_SOURCE_CATALOG,
-    MEDIA_SCOUT_URLS,
     MEDIA_SCOUT_THEMES,
     MEDIA_SCOUT_THEME_EMOJI,
     MEDIA_SCOUT_VEILLE_EMOJI,
@@ -24,9 +18,10 @@ from Settings import (
     data_media_scout,
     format_last_update,
     get_source_origin,
-    load_css,
     media_scrape_timestamp,
+    start_scout_refresh_scheduler,
     translate_titles_to_french,
+    _datetime_maroc,
 )
 
 
@@ -38,20 +33,25 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-load_css()
+start_scout_refresh_scheduler()
 
 
 # ─── Pre-warm cache (scraping global au demarrage) ────────────────────────────
-# data_media_scout est l'unique source : decoree @st.cache_data(persist="disk"),
-# cle de cache pilotee par le slot (07h00 / 19h00). On l'appelle ici pour peupler
-# le cache au demarrage ; tous les appels suivants (rendu du tableau de bord)
-# hit le cache en quelques millisecondes. persist="disk" -> le cache survit aux
-# redemarrages du conteneur (Streamlit Cloud) au sein d'un meme creneau.
+# Le cache est partage par creneau (07h00 / 19h00) et persiste sur le disque
+# disponible ; une reconstruction du conteneur peut supprimer ce disque.
 with st.spinner("Recherche d'actualités en cours sur l'ensemble des sources (2 mises à jour paramétrées : 7h00 et 19h00) — quelques minutes…"):
     _slot = current_cache_slot()
-    data_media_scout(MEDIA_SCOUT_URLS, slot=_slot)
-    # Fige l'horodatage de cette collecte (meme slot -> meme valeur jusqu'au prochain creneau)
-    media_scrape_timestamp(slot=_slot)
+    data_media_scout(slot=_slot)
+    st.session_state["scout_loaded_slot"] = _slot
+
+
+@st.fragment(run_every="30s")
+def _refresh_scout_session():
+    if st.session_state.get("scout_loaded_slot") != current_cache_slot():
+        st.rerun()
+
+
+_refresh_scout_session()
 
 
 # ─── Mois FR ──────────────────────────────────────────────────────────────────
@@ -99,18 +99,6 @@ def _event_card_date_parts(start_d, end_d=None):
         return f"{start_d.day:02d}-{end_d.day:02d}", _format_date_fr(start_d).split(" ", 1)[1]
     date_fr = _format_date_fr(start_d)
     return f"{start_d.day:02d}", date_fr.split(" ", 1)[1] if " " in date_fr else date_fr
-
-
-def _format_date_short(value):
-    if pd.isna(value):
-        return "—"
-    date_str = pd.Timestamp(value).strftime("%d %b %Y")
-    en_mois = {"Jan": "jan.", "Feb": "fév.", "Mar": "mars", "Apr": "avr.",
-               "May": "mai", "Jun": "juin", "Jul": "juil.", "Aug": "août",
-               "Sep": "sept.", "Oct": "oct.", "Nov": "nov.", "Dec": "déc."}
-    for en, fr in en_mois.items():
-        date_str = date_str.replace(en, fr)
-    return date_str
 
 
 def _veille_tone(veille: str) -> str:
@@ -263,17 +251,16 @@ html, body, [data-testid="stAppViewContainer"], [data-testid="stMain"] {
 [data-testid="stAppViewContainer"]{ padding-top:0 !important; top:0 !important; }
 [data-testid="stMain"]{ padding-top:0 !important; }
 /* Hide default streamlit padding so brand strip can hug top */
-div[data-testid="stAppViewContainer"] main .block-container {
+[data-testid="stMainBlockContainer"] {
     padding-top: 0.5rem !important;
-    padding-left: 2.5rem !important;
-    padding-right: 2.5rem !important;
+    padding-left: 3rem !important;
+    padding-right: 3rem !important;
+    padding-bottom: 0 !important;
     max-width: 1480px !important;
 }
 [data-testid="stSidebar"] { display: none !important; }
 [data-testid="collapsedControl"] { display: none !important; }
-.main-pad { max-width: 1380px; margin: 0 auto; }
-
-/* Override main.css legacy rules : left-align + restore normal p weight/size */
+/* Styles du contenu Markdown */
 div[data-testid="stMarkdownContainer"] {
     text-align: left !important;
     line-height: 1.55 !important;
@@ -337,9 +324,9 @@ div[data-testid="stMarkdownContainer"] h4 {
     box-shadow:0 4px 22px -10px rgba(74,64,48,.45) !important;
     backdrop-filter:blur(8px);
 }
-/* Compense la barre fixed + 3px offset : pousse le contenu juste sous */
-div[data-testid="stAppViewContainer"] main .block-container{
-    padding-top:70px !important;
+/* Le spacer du contenu laisse la place a la barre fixe. */
+[data-testid="stMainBlockContainer"]{
+    padding-top:0 !important;
 }
 """ if frozen else """
 /* Mode LIBERE : 5px du top, espacement natif entre les cadres conserve */
@@ -353,7 +340,7 @@ div[data-testid="stAppViewContainer"] main .block-container{
     box-shadow:0 2px 14px -10px rgba(74,64,48,.30) !important;
 }
 /* 5px exact entre l'extremite haute du viewport et la filterbar */
-div[data-testid="stAppViewContainer"] main .block-container{
+[data-testid="stMainBlockContainer"]{
     padding-top:5px !important;
 }
 /* PAS de gap-killer global : les cadres (Signal, Veille x4) gardent leur espacement naturel comme en pinned */
@@ -1037,7 +1024,7 @@ div[role="dialog"][aria-modal="true"]{
    (config.toml) et IGNORE nos variables CSS -> restait clair en dark mode.
    Cette table suit la palette light/dark et la DA (or + Cinzel). */
 /* Page Sources : conteneur eligible a une largeur superieure */
-div[data-testid="stAppViewContainer"] main .block-container:has(.st-key-sources-table){
+[data-testid="stMainBlockContainer"]:has(.st-key-sources-table){
     max-width:1760px !important;
 }
 .st-key-sources-table .sources-table-wrap{
@@ -1330,6 +1317,15 @@ table.sources-table{
 /* MOBILE RESPONSIVE (tablet & phone, <=768px)                              */
 /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
 @media (max-width: 768px) {
+    .st-key-veille-layout{
+        display:grid !important;
+        grid-template-columns:minmax(0, 1fr) !important;
+        gap:14px !important;
+    }
+    .st-key-veille-layout > [data-testid="stLayoutWrapper"]:has(> [data-testid="stHorizontalBlock"]),
+    .st-key-veille-layout > [data-testid="stLayoutWrapper"] > [data-testid="stHorizontalBlock"]{
+        display:contents !important;
+    }
     /* Mobile : supprimer les espaces (br) entre la topbar et le contenu */
     .st-key-landing-top-spacer,
     .st-key-veille-top-spacer{ display:none !important; }
@@ -1348,8 +1344,7 @@ table.sources-table{
 
     /* Main container : reduire padding lateral pour gagner de l espace */
     /* padding-top reduit car filterbar passe en flow sur mobile (position:relative) */
-    .stApp .block-container,
-    div[data-testid="stAppViewContainer"] main .block-container{
+    [data-testid="stMainBlockContainer"]{
         padding-left:12px !important;
         padding-right:12px !important;
         padding-top:12px !important;
@@ -1676,11 +1671,6 @@ def _future_events_for_themes(start_date, themes, months=12):
     return _events_in_window(start_date, end_date, themes=themes)
 
 
-# Alias retrocompatibilite
-_events_between = _events_in_window
-_ESG_EVENT_CATALOG = _EVENTS_CATALOG
-
-
 # Mapping tone -> variables CSS (s'adapte automatiquement light/dark)
 _VEILLE_TONE_VARS = {
     "reg": ("--gold-deep", "--paper-3"),
@@ -1905,7 +1895,7 @@ def _show_veille_details(veille, group, selected_themes, calendar_events=None):
 
 # ─── Dialog : Veille Evenementielle (calendrier 12 mois) ──────────────────────
 @st.dialog(" ", width="large")
-def _show_events_dialog(events, themes, start_date):
+def _show_events_dialog(events, start_date):
     st.markdown(f"### 📅 Veille Évènementielle")
     end_d = start_date + timedelta(days=365)
     st.caption(
@@ -1955,13 +1945,11 @@ def _show_events_dialog(events, themes, start_date):
     )
 
 
-def _cadre_synthesis_html(rows, veille_key: str, themes: list) -> str:
+def _cadre_synthesis_html(rows) -> str:
     """Liste compacte des titres du TOP 5 d'une veille (tri zone Maroc > UE >
     Monde, puis date), au format « ZONE : Titre » SANS la source.
 
-    Les titres sont garantis en français (traduits via cache si la source est en
-    anglais). Remplace l'ancienne synthèse LLM, source de phrases incomplètes /
-    incohérentes (« WW : d'énergie propre. (14 words) », etc.).
+    Les titres non francophones sont traduits via le cache des reponses LLM.
     """
     if rows.empty:
         return (
@@ -2232,6 +2220,11 @@ def _article_mentions_competitor(row, theme) -> bool:
 
 @st.fragment
 def _render_veille_dashboard(filtered_df, selected_themes, upcoming_events, start_date, signal_html_body):
+    with st.container(key="veille-layout"):
+        _render_veille_contents(filtered_df, selected_themes, upcoming_events, start_date, signal_html_body)
+
+
+def _render_veille_contents(filtered_df, selected_themes, upcoming_events, start_date, signal_html_body):
     # ── ROW 1 : Cercle Concurrentielle | Signal du jour (centre) | Cercle Evenementielle ──
     selected_veille = st.session_state.get("scout_selected_veille")
     n_events = len(upcoming_events)
@@ -2328,7 +2321,7 @@ def _render_veille_dashboard(filtered_df, selected_themes, upcoming_events, star
                     unsafe_allow_html=True,
                 )
                 # Synthese KPI/chiffres/idees generales via LLM (cache par contenu)
-                summary_html = _cadre_synthesis_html(group, veille_key, selected_themes)
+                summary_html = _cadre_synthesis_html(group)
                 st.markdown(summary_html, unsafe_allow_html=True)
                 if article_count > 0:
                     if st.button(
@@ -2351,210 +2344,9 @@ def _render_veille_dashboard(filtered_df, selected_themes, upcoming_events, star
 
     # ── Dialog Evenementielle ──
     if st.session_state.get("scout_show_events"):
-        _show_events_dialog(upcoming_events, selected_themes, start_date)
+        _show_events_dialog(upcoming_events, start_date)
         st.session_state.pop("scout_show_events", None)
 
-    # ── JS Mobile : reordre DOM + force styles via components.html ──
-    # IMPORTANT : st.html n'execute PAS les <script> (innerHTML restriction HTML5).
-    # components.html cree une iframe avec srcdoc -> les scripts s'executent VRAIMENT.
-    # Sur Streamlit Cloud, l'iframe est same-origin (meme app), donc on peut acceder
-    # a window.parent.document pour modifier le DOM principal.
-    components.html(
-        """
-<script>
-(function(){
-  // Helper : applique style avec !important pour battre les CSS rules !important
-  function setImp(el, prop, val){
-    if (!el) return;
-    el.style.setProperty(prop, val, 'important');
-  }
-  function applyMobileLayout(){
-    try {
-      var parentWin = window.parent || window;
-      var parentDoc = (window.parent && window.parent.document) || document;
-      var w = parentWin.innerWidth || parentDoc.documentElement.clientWidth || 1024;
-      if (w > 768) return;
-
-      function findCol(key){
-        var el = parentDoc.querySelector('.' + key);
-        return el ? el.closest('[data-testid="stColumn"]') : null;
-      }
-
-      var signalCol = findCol('st-key-signal-wrap');
-      var infCol    = findCol('st-key-cadre-inf');
-      var regCol    = findCol('st-key-cadre-reg');
-      var conCol    = findCol('st-key-open_con_btn');   // optionnel (T3 only)
-      var evtCol    = findCol('st-key-open_events_btn');
-
-      // conCol est OPTIONNEL : absent quand le theme n'est pas T3 laitier.
-      // Les 4 autres restent obligatoires (signal + inf + reg + evenementiel).
-      if (!signalCol || !infCol || !regCol || !evtCol) return;
-
-      // 1. CREER UN CONTAINER EXTERNE hors de l'arbre React Streamlit
-      //    React ne suivra pas ce div -> notre reordre survit aux reruns Streamlit
-      var stack = parentDoc.getElementById('veille-mobile-stack');
-      // Ordre mobile : Signal -> Inf -> Reg -> Concurrentielle (si present) -> Evt
-      var ordered = conCol
-        ? [signalCol, infCol, regCol, conCol, evtCol]
-        : [signalCol, infCol, regCol, evtCol];
-
-      if (!stack) {
-        stack = parentDoc.createElement('div');
-        stack.id = 'veille-mobile-stack';
-        // Inserer juste avant le 1er stHorizontalBlock qui contient une de nos cols
-        var anchor = signalCol.closest('[data-testid="stHorizontalBlock"]');
-        if (anchor && anchor.parentNode) {
-          anchor.parentNode.insertBefore(stack, anchor);
-        } else {
-          // Fallback : append au body si on ne trouve pas l'ancre
-          parentDoc.body.appendChild(stack);
-        }
-      }
-      // Toujours forcer styles flex column 100% sur le stack
-      setImp(stack, 'display', 'flex');
-      setImp(stack, 'flex-direction', 'column');
-      setImp(stack, 'gap', '14px');
-      setImp(stack, 'width', '100%');
-      setImp(stack, 'max-width', '100%');
-      setImp(stack, 'align-items', 'stretch');
-      setImp(stack, 'margin', '0');
-      setImp(stack, 'padding', '0');
-
-      // 2. Deplacer les 5 cols dans le stack (dans l'ordre voulu)
-      //    Verifier si necessaire pour eviter appendChild dans une boucle observer
-      var needsReorder = false;
-      for (var i = 0; i < ordered.length; i++) {
-        if (ordered[i].parentElement !== stack) { needsReorder = true; break; }
-      }
-      if (needsReorder) {
-        ordered.forEach(function(col){ stack.appendChild(col); });
-      }
-
-      // 3. Ordre CSS inline (redondance defensive)
-      ordered.forEach(function(col, idx){
-        setImp(col, 'order', String(idx + 1));
-      });
-
-      // 4. Masquer les stHorizontalBlock devenus vides (row1 et row2 d'origine)
-      var allHB = parentDoc.querySelectorAll('[data-testid="stHorizontalBlock"]');
-      allHB.forEach(function(hb){
-        if (hb.querySelectorAll('[data-testid="stColumn"]').length === 0) {
-          setImp(hb, 'display', 'none');
-        }
-      });
-
-      // 5. Largeur 100% sur tous les ancetres du stack jusqu au body
-      var ancestor = stack.parentElement;
-      var depth = 0;
-      while (ancestor && depth < 8 && ancestor.tagName !== 'BODY'){
-        setImp(ancestor, 'width', '100%');
-        setImp(ancestor, 'max-width', '100%');
-        ancestor = ancestor.parentElement;
-        depth++;
-      }
-
-      // 3. Chaque colonne : pleine largeur + flex pour centrer le contenu
-      //    (filtre les eventuels null comme conCol absent)
-      [signalCol, infCol, regCol, conCol, evtCol].filter(Boolean).forEach(function(c){
-        setImp(c, 'width', '100%');
-        setImp(c, 'flex', '1 1 100%');
-        setImp(c, 'max-width', '100%');
-        setImp(c, 'min-width', '0');
-        setImp(c, 'padding', '0');
-        setImp(c, 'align-self', 'stretch');
-        setImp(c, 'display', 'flex');
-        setImp(c, 'flex-direction', 'column');
-        setImp(c, 'justify-content', 'center');
-        setImp(c, 'align-items', 'center');
-      });
-
-      // 4. Cercles -> carres arrondis PLEINE LARGEUR CENTRES
-      var btnHeight = w <= 480 ? '95px' : '110px';
-      var btnFont = w <= 480 ? '12.5px' : '13.5px';
-      ['st-key-open_events_btn', 'st-key-open_con_btn'].forEach(function(key){
-        var wrap = parentDoc.querySelector('.' + key);
-        if (!wrap) return;
-        // Container wrapper : pleine largeur + centre
-        setImp(wrap, 'width', '100%');
-        setImp(wrap, 'max-width', '100%');
-        setImp(wrap, 'display', 'flex');
-        setImp(wrap, 'justify-content', 'center');
-        setImp(wrap, 'align-items', 'center');
-        setImp(wrap, 'margin-left', 'auto');
-        setImp(wrap, 'margin-right', 'auto');
-        // Inner divs : pleine largeur centres
-        Array.prototype.forEach.call(wrap.children, function(child){
-          setImp(child, 'width', '100%');
-          setImp(child, 'max-width', '100%');
-          setImp(child, 'display', 'flex');
-          setImp(child, 'justify-content', 'center');
-          setImp(child, 'align-items', 'center');
-        });
-        // stButton wrapper
-        var stBtn = wrap.querySelector('[data-testid="stButton"]');
-        if (stBtn) {
-          setImp(stBtn, 'width', '100%');
-          setImp(stBtn, 'max-width', '100%');
-          setImp(stBtn, 'display', 'flex');
-          setImp(stBtn, 'justify-content', 'center');
-        }
-        // <button> element : pleine largeur, centre, carre arrondi
-        var btn = wrap.querySelector('button');
-        if (!btn) return;
-        setImp(btn, 'width', '100%');
-        setImp(btn, 'max-width', '100%');
-        setImp(btn, 'min-width', '0');
-        // Hauteur auto (min-height) + padding interne plus genereux
-        setImp(btn, 'min-height', w <= 480 ? '115px' : '130px');
-        setImp(btn, 'height', 'auto');
-        setImp(btn, 'border-radius', '16px');
-        setImp(btn, 'padding', w <= 480 ? '20px 22px' : '24px 28px');
-        setImp(btn, 'font-size', btnFont);
-        setImp(btn, 'margin-left', 'auto');
-        setImp(btn, 'margin-right', 'auto');
-        setImp(btn, 'display', 'flex');
-        setImp(btn, 'align-items', 'center');
-        setImp(btn, 'justify-content', 'center');
-      });
-    } catch(err){
-      console.warn('[Mobile layout] error:', err);
-    }
-  }
-  applyMobileLayout();
-  setTimeout(applyMobileLayout, 200);
-  setTimeout(applyMobileLayout, 600);
-  setTimeout(applyMobileLayout, 1500);
-  setTimeout(applyMobileLayout, 3000);
-  try { (window.parent || window).addEventListener('resize', applyMobileLayout); } catch(e){}
-
-  // MutationObserver dans le PARENT DOC : reapplique des que Streamlit/React modifie
-  // (rerun, dialog open/close, etc.). Throttle via requestAnimationFrame.
-  try {
-    var pDoc = (window.parent && window.parent.document) || document;
-    var pWin = window.parent || window;
-    if (typeof MutationObserver !== 'undefined' && pWin && !pWin._veilleMobileObs){
-      var pending = false;
-      pWin._veilleMobileObs = new MutationObserver(function(){
-        if (pending) return;
-        pending = true;
-        (pWin.requestAnimationFrame || window.requestAnimationFrame)(function(){
-          pending = false;
-          applyMobileLayout();
-        });
-      });
-      pWin._veilleMobileObs.observe(pDoc.body, {
-        childList: true,
-        subtree: true
-      });
-    }
-  } catch(e){
-    console.warn('[Mobile observer] error:', e);
-  }
-})();
-</script>
-        """,
-        height=0,
-    )
 
 
 # ─── UI STATE (dark mode + filterbar freeze + vue active) ────────────────────
@@ -2610,7 +2402,7 @@ with st.container(key="filter-row"):
     fb_cols = st.columns([1.6, 5.0, 1.5, 1.2, 0.5, 0.5], gap="small", vertical_alignment="center")
 
     with fb_cols[0]:
-        today = date.today()
+        today = _datetime_maroc().date()
         # today-4 -> plage de 5 jours CALENDAIRES inclus (ex: 31/05 -> 04/06)
         days_ago = today - timedelta(days=4)
         date_select = st.date_input(
@@ -2640,7 +2432,7 @@ with st.container(key="filter-row"):
 
     with fb_cols[2]:
         # Dernière mise à jour automatique des données (créneaux 07h / 19h, heure Maroc)
-        _last_upd = format_last_update(media_scrape_timestamp(slot=current_cache_slot()))
+        _last_upd = format_last_update(media_scrape_timestamp(slot=_slot))
         with st.container(key="lastupd-box"):
             st.markdown(
                 '<div class="last-update" '
@@ -2700,6 +2492,7 @@ with st.container(key="filter-row"):
 # aria-label de chaque bouton-jour, et grise ceux hors plage (futurs / >15j).
 components.html(
     f"""
+<html><body>
 <script>
 (function(){{
   function greyOutOfRangeDates(){{
@@ -2710,7 +2503,7 @@ components.html(
       var today = new Date();
       today.setHours(23, 59, 59, 999);  // inclus aujourd'hui
       var minDate = new Date(today);
-      minDate.setDate(minDate.getDate() - 30);
+      minDate.setDate(minDate.getDate() - 15);
       minDate.setHours(0, 0, 0, 0);
       var monthMap = {{
         'January':0,'February':1,'March':2,'April':3,'May':4,'June':5,
@@ -2800,6 +2593,7 @@ components.html(
   }} catch(e){{}}
 }})();
 </script>
+</body></html>
     """,
     height=0,
 )
@@ -2874,7 +2668,7 @@ if st.session_state.get("scout_view", "veille") == "veille":
                     _render_theme_btn(_theme, 3 + _k)
     else:
         with st.spinner("Synthèse des signaux..."):
-            media_data_df = data_media_scout(MEDIA_SCOUT_URLS, slot=current_cache_slot())
+            media_data_df = data_media_scout(slot=_slot)
             start_date, end_date = date_select
             filtered_df = media_data_df[
                 (media_data_df["Date"] >= pd.Timestamp(start_date))
@@ -3115,8 +2909,8 @@ st.markdown('<div style="height:80px"></div>', unsafe_allow_html=True)
 # Lecture : st.context.cookies à l'initialisation de session (cf. UI STATE).
 _dark_flag = "1" if st.session_state.get("dark_mode", False) else "0"
 components.html(
-    "<script>try{window.parent.document.cookie="
+    "<html><body><script>try{window.parent.document.cookie="
     f"'scout_dark={_dark_flag}; max-age=31536000; path=/; SameSite=Lax';"
-    "}catch(e){}</script>",
+    "}catch(e){}</script></body></html>",
     height=0,
 )
