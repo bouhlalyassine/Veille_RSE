@@ -6,6 +6,7 @@ import unicodedata
 from datetime import date, timedelta
 from html import escape
 from io import BytesIO
+from time import monotonic
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
@@ -18,11 +19,11 @@ from Settings import (
     MEDIA_SCOUT_FORCED_SOURCE_THEMES,
     MEDIA_SCOUT_SOURCE_ZONES,
     compute_signal_du_jour,
+    select_signal_candidates,
     current_cache_slot,
     data_media_scout,
     format_last_update,
     get_source_origin,
-    media_scrape_timestamp,
     start_scout_refresh_scheduler,
     translate_titles_to_french,
     _datetime_maroc,
@@ -43,10 +44,54 @@ start_scout_refresh_scheduler()
 # ─── Pre-warm cache (scraping global au demarrage) ────────────────────────────
 # Le cache est partage par creneau (07h00 / 19h00) et persiste sur le disque
 # disponible ; une reconstruction du conteneur peut supprimer ce disque.
-with st.spinner("Recherche d'actualités en cours sur l'ensemble des sources (2 mises à jour paramétrées : 7h00 et 19h00) — quelques minutes…"):
+_loading_status = st.empty()
+_loading_status.markdown(
+    """
+<style>
+.scout-loading {
+    position: fixed; top: 68px; left: 24px; z-index: 1000001;
+    display: flex; align-items: flex-start; gap: 10px;
+    max-width: calc(100vw - 48px);
+    color: #287568; font-size: 14px; font-weight: 500; line-height: 1.6;
+    letter-spacing: 0; pointer-events: none;
+    opacity: 0; animation: scout-loading-appear .15s ease .4s forwards;
+}
+.scout-loading[data-dark="true"] { color: #90cfbe; }
+.scout-loading-ring {
+    width: 14px; height: 14px; flex: 0 0 14px; box-sizing: border-box; margin-top: 4px;
+    border: 1.5px solid #cee5de; border-top-color: #287568;
+    border-radius: 50%; animation: scout-loading-spin 1s linear infinite;
+}
+.scout-loading[data-dark="true"] .scout-loading-ring {
+    border-color: #344f49; border-top-color: #90cfbe;
+}
+@keyframes scout-loading-spin { to { transform: rotate(360deg); } }
+@keyframes scout-loading-appear { to { opacity: 1; } }
+@media (max-width: 600px) {
+    .scout-loading { top: 64px; left: 16px; font-size: 12px; max-width: calc(100vw - 32px); }
+}
+@media (prefers-reduced-motion: reduce) {
+    .scout-loading { animation: none; opacity: 1; }
+    .scout-loading-ring { animation: none; }
+}
+</style>
+"""
+    + f'<div class="scout-loading" data-dark="{str(st.session_state.get("dark_mode", False)).lower()}" '
+      'role="status" aria-live="polite" aria-atomic="true">'
+      '<span class="scout-loading-ring" aria-hidden="true"></span>'
+      "<span>Recherche d'actualités en cours sur l'ensemble des sources "
+      "(2 mises à jour paramétrées : 7h00 et 19h00) — quelques minutes…</span></div>",
+    unsafe_allow_html=True,
+)
+try:
     _slot = current_cache_slot()
-    data_media_scout(slot=_slot)
-    st.session_state["scout_loaded_slot"] = _slot
+    if (st.session_state.get("scout_loaded_slot") != _slot
+            or "scout_data_snapshot" not in st.session_state):
+        st.session_state["scout_data_snapshot"] = data_media_scout(slot=_slot)
+        st.session_state["scout_loaded_slot"] = _slot
+    media_data_df = st.session_state["scout_data_snapshot"]
+finally:
+    _loading_status.empty()
 
 
 @st.fragment(run_every="30s")
@@ -56,6 +101,22 @@ def _refresh_scout_session():
 
 
 _refresh_scout_session()
+
+
+def _session_signal(articles_context):
+    """Keep view-only reruns offline; retry temporary failures after one minute."""
+    cache = st.session_state.setdefault("scout_signal_cache", {})
+    key = (_slot, articles_context)
+    now = monotonic()
+    cached = cache.get(key)
+    if cached and cached[0] > now:
+        return cached[1]
+    signal = compute_signal_du_jour(articles_context)
+    ttl = 43200 if signal.get("available") else 60
+    cache[key] = (monotonic() + ttl, signal)
+    while len(cache) > 16:
+        del cache[next(iter(cache))]
+    return signal
 
 
 # ─── Mois FR ──────────────────────────────────────────────────────────────────
@@ -131,7 +192,7 @@ def _theme_display(theme: str) -> str:
         "Aquaculture (elevage et transformation)":       "🐟 Aquaculture (élevage & transformation)",
         "Produits laitiers & Epicerie fine":             "🧀 Produits laitiers & Épicerie fine",
         "Environnement, Eau & Energie":                  "🌍 Environnement, Eau & Énergie",
-        "ESG, QSE & SST":                                "🏛️ Normes : ESG, QSE & SST",
+        "ESG, QSE & SST":                                "🏛️ Normes & Conformité (ESG, QSE & SST)",
     }.get(theme, theme)
 
 
@@ -1008,7 +1069,53 @@ div[role="dialog"][aria-modal="true"]{
     font-family:"Inter" !important; font-weight:800 !important;
     font-size:21px !important; line-height:1.4 !important;
     color:var(--ink) !important;
+    text-align:center !important;
     text-shadow:0 1px 3px var(--paper) !important;        /* lisibilité sur le dégradé */
+}
+
+.st-key-theme-picker{
+    display:grid !important;
+    grid-template-columns:minmax(0, 1fr) minmax(0, 1.25fr) minmax(0, 1fr) !important;
+    gap:18px 24px !important;
+    align-items:center !important;
+}
+.st-key-theme-picker > [data-testid="stLayoutWrapper"]:has(> .st-key-featured-theme){
+    grid-column:2; grid-row:1; min-width:0;
+}
+.st-key-featured-theme .stButton button{
+    min-height:210px !important;
+    border:2px solid var(--teal) !important;
+    background:linear-gradient(135deg, var(--teal-soft), var(--paper)) !important;
+    box-shadow:0 9px 24px -16px var(--teal) !important;
+    padding:24px !important;
+}
+.st-key-featured-theme .stButton button:hover{
+    border-color:var(--teal-deep) !important;
+    box-shadow:0 14px 28px -16px var(--teal) !important;
+}
+.st-key-featured-theme button p{
+    font-size:14px !important; font-weight:500 !important;
+    color:var(--teal-deep) !important; margin:0 !important;
+    text-align:center !important;
+}
+.st-key-featured-theme button strong{
+    display:block; font-size:26px; font-weight:800; line-height:1.25;
+    color:var(--ink); margin-bottom:10px; letter-spacing:0;
+}
+@media (min-width: 601px) and (max-width: 1000px){
+    .st-key-theme-picker{ grid-template-columns:repeat(2, minmax(0, 1fr)) !important; }
+    .st-key-theme-picker > [data-testid="stLayoutWrapper"]:has(> .st-key-featured-theme){
+        grid-column:1 / -1; grid-row:1;
+    }
+    .st-key-featured-theme .stButton button{ min-height:180px !important; }
+}
+@media (max-width: 600px){
+    .st-key-theme-picker{ grid-template-columns:minmax(0, 1fr) !important; gap:12px !important; }
+    .st-key-theme-picker > [data-testid="stLayoutWrapper"]:has(> .st-key-featured-theme){
+        grid-column:1; grid-row:1;
+    }
+    .st-key-featured-theme .stButton button{ min-height:180px !important; padding:20px !important; }
+    .st-key-featured-theme button strong{ font-size:24px; }
 }
 
 /* Sources section heading (compact : plus de <br> ni de trait separateur) */
@@ -2424,7 +2531,7 @@ with st.container(key="filter-row"):
         # une valeur via st.session_state (callback _select_theme).
         selected_theme = st.selectbox(
             label="Thème",
-            options=MEDIA_SCOUT_THEMES,
+            options=sorted(MEDIA_SCOUT_THEMES, key=lambda theme: theme != "ESG, QSE & SST"),
             index=None,
             key="theme_select",
             format_func=_theme_display,  # _theme_display inclut deja l'emoji
@@ -2436,7 +2543,7 @@ with st.container(key="filter-row"):
 
     with fb_cols[2]:
         # Dernière mise à jour automatique des données (créneaux 07h / 19h, heure Maroc)
-        _last_upd = format_last_update(media_scrape_timestamp(slot=_slot))
+        _last_upd = format_last_update(media_data_df.attrs.get("collected_at"))
         with st.container(key="lastupd-box"):
             st.markdown(
                 '<div class="last-update" '
@@ -2625,7 +2732,7 @@ if st.session_state.get("scout_view", "veille") == "veille":
     if issues:
         # Landing visuel : grands boutons (1 par thème) avec dégradé de couleur
         # dédié + emoji en filigrane. Au clic, le thème est pré-sélectionné et le
-        # tableau de bord s'affiche. Disposition : grille 3 × 2 (6 thèmes).
+        # tableau de bord s'affiche. Le theme Normes est mis en avant au centre.
         # Espace haut (br) masqué en mobile via .st-key-landing-top-spacer (CSS).
         with st.container(key="landing-top-spacer"):
             st.markdown("<br>", unsafe_allow_html=True)
@@ -2650,29 +2757,26 @@ if st.session_state.get("scout_view", "veille") == "veille":
         st.markdown(_btn_visual_css, unsafe_allow_html=True)
 
         def _render_theme_btn(theme, idx):
+            label = ("**Normes & Conformité**\n\nESG, QSE & SST"
+                     if theme == "ESG, QSE & SST" else _theme_plain(theme))
             st.button(
-                _theme_plain(theme),  # nom sans emoji (le filigrane fournit l'emoji)
+                label,
                 key=f"theme_btn_{idx}",
                 on_click=_select_theme,
                 args=(theme,),
                 width="stretch",
             )
 
-        _themes = MEDIA_SCOUT_THEMES
-        # Grille 3 × 2 : 3 boutons par ligne (6 thèmes).
-        _row1 = st.columns(3, gap="medium")
-        for _j in range(min(3, len(_themes))):
-            with _row1[_j]:
-                _render_theme_btn(_themes[_j], _j)
-        _rest = _themes[3:]
-        if _rest:
-            _row2 = st.columns(3, gap="medium")
-            for _k, _theme in enumerate(_rest[:3]):
-                with _row2[_k]:
-                    _render_theme_btn(_theme, 3 + _k)
+        with st.container(key="theme-picker"):
+            # First in keyboard/mobile order; CSS places it in the desktop centre.
+            _featured_idx = MEDIA_SCOUT_THEMES.index("ESG, QSE & SST")
+            with st.container(key="featured-theme"):
+                _render_theme_btn(MEDIA_SCOUT_THEMES[_featured_idx], _featured_idx)
+            for _idx, _theme in enumerate(MEDIA_SCOUT_THEMES):
+                if _idx != _featured_idx:
+                    _render_theme_btn(_theme, _idx)
     else:
         with st.spinner("Synthèse des signaux..."):
-            media_data_df = data_media_scout(slot=_slot)
             start_date, end_date = date_select
             filtered_df = media_data_df[
                 (media_data_df["Date"] >= pd.Timestamp(start_date))
@@ -2688,25 +2792,16 @@ if st.session_state.get("scout_view", "veille") == "veille":
             st.info("Aucune actualité pertinente trouvée sur la période et les thèmes sélectionnés.")
         else:
             # ── SIGNAL DU JOUR ────────────────────────────────────────────────
-            # Pool de candidats. Pour les thèmes à profil concurrentiel (T1/T3),
-            # on garantit la présence de la Veille Concurrentielle (pertinente,
-            # filtrée) aux côtés du Réglementaire / Informatif — sinon elle est
-            # écrasée par le volume des autres veilles et ne pèse jamais.
+            # Tous les articles sont evalues avant de borner le contexte IA.
+            # Le classement reserve une place a chaque veille representee.
             _sig_con_theme = _con_theme(selected_themes)
+            _signal_candidates = filtered_df
             if _sig_con_theme:
-                _pool_parts = []
-                for _v in ("Veille Reglementaire", "Veille Informative", "Veille Concurrentielle"):
-                    _vsub = filtered_df[filtered_df["Veille"] == _v]
-                    if _v == "Veille Concurrentielle" and not _vsub.empty:
-                        _vsub = _vsub[_vsub.apply(
-                            lambda r: _article_mentions_competitor(r, _sig_con_theme), axis=1
-                        )]
-                    _pool_parts.append(_vsub.sort_values("Date", ascending=False).head(8))
-                _signal_pool = pd.concat(_pool_parts)
-                if _signal_pool.empty:
-                    _signal_pool = filtered_df.head(25)
-            else:
-                _signal_pool = filtered_df.head(25)
+                _signal_candidates = filtered_df[filtered_df.apply(
+                    lambda r: r["Veille"] != "Veille Concurrentielle"
+                    or _article_mentions_competitor(r, _sig_con_theme), axis=1
+                )] if not filtered_df.empty else filtered_df
+            _signal_pool = select_signal_candidates(_signal_candidates, selected_themes)
             signal_articles = tuple(
                 " | ".join(
                     part for part in [
@@ -2723,30 +2818,32 @@ if st.session_state.get("scout_view", "veille") == "veille":
                 for _, row in _signal_pool.iterrows()
             )
             with st.spinner("Analyse des actualités et identification du signal du jour…"):
-                signal = compute_signal_du_jour(signal_articles)
+                signal = _session_signal(signal_articles)
 
             _signal_tooltip = (
-                "Le Signal du jour est identifié automatiquement par l'IA parmi tous les articles "
-                "captés sur la période sélectionnée. L'IA évalue chaque article au regard du contexte "
-                "et des activités de Les Domaines Agricoles : agriculture, élevage, agro-industrie et "
-                "exports. Critères de sélection : nouvelle réglementation UE/Maroc, mise à jour de "
-                "normes (ISO, GlobalGAP, IFS, BRC, etc...), décision tarifaire ou accord commercial, "
-                "mouvement concurrentiel, évolution des exigences clients export, audit QSE — tout "
-                "signal à fort impact potentiel pour les opérations du groupe."
+                "Les actualités du thème et de la période sont classées selon leur pertinence, "
+                "leur impact concret pour Les Domaines Agricoles et leur fraîcheur. "
+                "Le Signal privilégie le Maroc, l'Union européenne et les sujets de portée mondiale. "
+                "Une actualité locale d'un pays tiers exige un lien explicite avec ce périmètre. "
+                "La zone WW d'un flux ne prouve pas une portée mondiale. "
+                "L'IA examine jusqu'à 25 candidats, avec une place réservée à chaque veille présente. "
+                "Une publication réglementaire n'est pas prioritaire par défaut. "
+                "Un Signal du jour est affiché seulement si les informations disponibles le justifient."
             )
 
+            source_url = signal.get("source_url", "").strip()
+            src_block = (
+                f'<a class="signal-source" href="{escape(source_url, quote=True)}" '
+                f'target="_blank" rel="noopener" title="Ouvrir l\'article d\'origine">'
+                f'🔗 Article d\'origine →</a>'
+                if source_url else ""
+            )
             if signal.get("available") and signal.get("headline"):
                 eyebrow = escape(signal.get("eyebrow", ""))
                 headline = escape(signal.get("headline", ""))
                 body = escape(signal.get("body", ""))
-                source_url = signal.get("source_url", "").strip()
                 cat_block = f'<span class="sep">·</span><span class="cat">{eyebrow}</span>' if eyebrow else ""
-                src_block = (
-                    f'<a class="signal-source" href="{escape(source_url, quote=True)}" '
-                    f'target="_blank" rel="noopener" title="Ouvrir l\'article d\'origine">'
-                    f'🔗 Article d\'origine →</a>'
-                    if source_url else ""
-                )
+                excerpt_label = "<strong>Extrait de l’article :</strong> " if signal.get("summary_kind") == "source_excerpt" else ""
                 signal_html_body = (
                     '<div class="signal-eyebrow">'
                     '<span class="badge">★ Signal du jour</span>'
@@ -2754,7 +2851,15 @@ if st.session_state.get("scout_view", "veille") == "veille":
                     f'{cat_block}'
                     '</div>'
                     f'<h2>{headline}</h2>'
-                    f'<p>{body}</p>'
+                    f'<p>{excerpt_label}{body}</p>'
+                    f'{src_block}'
+                )
+            elif signal.get("reason") == "summary_unavailable":
+                signal_html_body = (
+                    '<div class="signal-eyebrow"><span class="badge">★ Signal du jour</span></div>'
+                    '<h2>Résumé temporairement indisponible</h2>'
+                    '<p>Le résumé de l’article n’a pas pu être généré. '
+                    'Consultez sa publication d’origine.</p>'
                     f'{src_block}'
                 )
             else:
