@@ -3,15 +3,19 @@
 #  git add .    # git commit -m "Màj"   # git push -u origin master # git remote -v
 
 import unicodedata
+import re
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from html import escape
-from io import BytesIO
+from functools import partial
 from time import monotonic
+from textwrap import shorten
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
 from Settings import (
+    sources_excel_bytes,
     MEDIA_SCOUT_SOURCE_CATALOG,
     MEDIA_SCOUT_THEMES,
     MEDIA_SCOUT_THEME_EMOJI,
@@ -24,6 +28,8 @@ from Settings import (
     data_media_scout,
     format_last_update,
     get_source_origin,
+    source_display_name,
+    article_source_name,
     start_scout_refresh_scheduler,
     translate_titles_to_french,
     _datetime_maroc,
@@ -38,7 +44,32 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
+# ─── UI STATE (dark mode + filterbar freeze + vue active) ────────────────────
+if "dark_mode" not in st.session_state:
+    # Restaure la préférence depuis le COOKIE navigateur (persiste entre les
+    # sessions : un user qui a activé le dark mode le retrouve en revenant).
+    # Le cookie est écrit par le bloc JS de synchronisation en fin de script ;
+    # st.context.cookies le lit au chargement. Fallback : mode clair.
+    try:
+        st.session_state["dark_mode"] = st.context.cookies.get("scout_dark") == "1"
+    except Exception:
+        st.session_state["dark_mode"] = False
+if "filterbar_frozen" not in st.session_state:
+    st.session_state["filterbar_frozen"] = True
+# Vue active : "veille" (tableau de bord, par defaut) ou "apropos" (page Sources)
+if "scout_view" not in st.session_state:
+    st.session_state["scout_view"] = "veille"
+
+
 start_scout_refresh_scheduler()
+
+
+def _scout_refresh_due():
+    snapshot = st.session_state.get("scout_data_snapshot")
+    if snapshot is None or st.session_state.get("scout_loaded_slot") != current_cache_slot():
+        return True
+    retry_at = snapshot.attrs.get("retry_at")
+    return retry_at is not None and _datetime_maroc() >= retry_at
 
 
 # ─── Pre-warm cache (scraping global au demarrage) ────────────────────────────
@@ -49,14 +80,17 @@ _loading_status.markdown(
     """
 <style>
 .scout-loading {
-    position: fixed; top: 68px; left: 24px; z-index: 1000001;
-    display: flex; align-items: flex-start; gap: 10px;
-    max-width: calc(100vw - 48px);
+    position:fixed; inset:0; z-index:1000001;
+    display:flex; align-items:center; justify-content:center; gap:14px;
+    padding:24px; background:#FDFBF6;
     color: #287568; font-size: 14px; font-weight: 500; line-height: 1.6;
     letter-spacing: 0; pointer-events: none;
     opacity: 0; animation: scout-loading-appear .15s ease .4s forwards;
 }
-.scout-loading[data-dark="true"] { color: #90cfbe; }
+.scout-loading[data-dark="true"] { color:#90cfbe; background:#171A1E; }
+.scout-loading-copy { max-width:540px; }
+.scout-loading-copy strong { display:block; font-size:20px; margin-bottom:6px; }
+[data-testid="stException"] { position:relative; z-index:1000002; }
 .scout-loading-ring {
     width: 14px; height: 14px; flex: 0 0 14px; box-sizing: border-box; margin-top: 4px;
     border: 1.5px solid #cee5de; border-top-color: #287568;
@@ -68,7 +102,8 @@ _loading_status.markdown(
 @keyframes scout-loading-spin { to { transform: rotate(360deg); } }
 @keyframes scout-loading-appear { to { opacity: 1; } }
 @media (max-width: 600px) {
-    .scout-loading { top: 64px; left: 16px; font-size: 12px; max-width: calc(100vw - 32px); }
+    .scout-loading { padding:20px; font-size:13px; }
+    .scout-loading-copy strong { font-size:18px; }
 }
 @media (prefers-reduced-motion: reduce) {
     .scout-loading { animation: none; opacity: 1; }
@@ -79,44 +114,63 @@ _loading_status.markdown(
     + f'<div class="scout-loading" data-dark="{str(st.session_state.get("dark_mode", False)).lower()}" '
       'role="status" aria-live="polite" aria-atomic="true">'
       '<span class="scout-loading-ring" aria-hidden="true"></span>'
-      "<span>Recherche d'actualités en cours sur l'ensemble des sources "
-      "(2 mises à jour paramétrées : 7h00 et 19h00) — quelques minutes…</span></div>",
+      '<div class="scout-loading-copy"><strong>Préparation de votre veille</strong>'
+      "Recherche des actualités et préparation des résumés par thème… "
+      "L’interface s’affichera dès que la préparation sera terminée.</div></div>",
     unsafe_allow_html=True,
 )
 try:
     _slot = current_cache_slot()
-    if (st.session_state.get("scout_loaded_slot") != _slot
-            or "scout_data_snapshot" not in st.session_state):
+    if _scout_refresh_due():
         st.session_state["scout_data_snapshot"] = data_media_scout(slot=_slot)
         st.session_state["scout_loaded_slot"] = _slot
     media_data_df = st.session_state["scout_data_snapshot"]
-finally:
+except Exception:
     _loading_status.empty()
+    raise
 
 
 @st.fragment(run_every="30s")
 def _refresh_scout_session():
-    if st.session_state.get("scout_loaded_slot") != current_cache_slot():
+    if _scout_refresh_due():
+        st.rerun()
+    retry_at = st.session_state.get("scout_signals_retry_at")
+    if retry_at is not None and monotonic() >= retry_at:
+        st.session_state.pop("scout_signals_snapshot", None)
+        st.session_state.pop("scout_signals_retry_at", None)
         st.rerun()
 
 
 _refresh_scout_session()
 
 
-def _session_signal(articles_context):
-    """Keep view-only reruns offline; retry temporary failures after one minute."""
+def _session_signals(contexts):
+    """Analyse les contextes manquants ensemble ; le thread principal gère la session."""
     cache = st.session_state.setdefault("scout_signal_cache", {})
-    key = (_slot, articles_context)
     now = monotonic()
-    cached = cache.get(key)
-    if cached and cached[0] > now:
-        return cached[1]
-    signal = compute_signal_du_jour(articles_context)
-    ttl = 43200 if signal.get("available") else 60
-    cache[key] = (monotonic() + ttl, signal)
+    missing = list(dict.fromkeys(
+        context for context in contexts.values()
+        if not cache.get(("signals-v3", _slot, context)) or cache[("signals-v3", _slot, context)][0] <= now
+    ))
+    if missing:
+        with ThreadPoolExecutor(max_workers=min(2, len(missing))) as executor:
+            for context, signal in zip(missing, executor.map(compute_signal_du_jour, missing)):
+                signal = dict(signal)
+                retryable = signal.get("retryable", signal.get("reason") == "summary_unavailable")
+                if retryable:
+                    signal["retryable"] = True
+                ttl = max(60, signal.get("retry_after_seconds", 60)) if retryable else 43200
+                cache[("signals-v3", _slot, context)] = (monotonic() + ttl, signal)
+    signals = {
+        theme: cache[("signals-v3", _slot, context)][1]
+        for theme, context in contexts.items()
+    }
+    for context in dict.fromkeys(contexts.values()):
+        key = ("signals-v3", _slot, context)
+        cache[key] = cache.pop(key)
     while len(cache) > 16:
         del cache[next(iter(cache))]
-    return signal
+    return signals
 
 
 # ─── Mois FR ──────────────────────────────────────────────────────────────────
@@ -192,7 +246,7 @@ def _theme_display(theme: str) -> str:
         "Aquaculture (elevage et transformation)":       "🐟 Aquaculture (élevage & transformation)",
         "Produits laitiers & Epicerie fine":             "🧀 Produits laitiers & Épicerie fine",
         "Environnement, Eau & Energie":                  "🌍 Environnement, Eau & Énergie",
-        "ESG, QSE & SST":                                "🏛️ Normes & Conformité (ESG, QSE & SST)",
+        "ESG, QSE & SST":                                "🏛️ Normes & Conformité (QSE, SST & ESG)",
     }.get(theme, theme)
 
 
@@ -237,23 +291,27 @@ def _design_css(dark: bool = False, frozen: bool = True) -> str:
         # accents or eclaircis pour le contraste. L'identite DA (or + serif) reste.
         palette = """
 :root{
-  --paper:#111316;
-  --paper-2:#1A1D22;
-  --paper-3:#24282F;
-  --ink:#ECE9E1;
-  --ink-2:#C8C3B7;
-  --ink-3:#918B7D;
-  --ink-4:#686257;
-  --line:#2D3037;
-  --line-soft:#22252B;
-  --line-strong:#8A7A52;
-  --gold:#D2B677;
-  --gold-deep:#B79E66;
+  color-scheme:dark;
+  --paper:#17191D;
+  --paper-2:#202329;
+  --paper-3:#2B2F36;
+  --ink:#E3E0D9;
+  --ink-2:#C5C1B8;
+  --ink-3:#AAA69B;
+  --ink-4:#989792;
+  --line:#383C43;
+  --line-soft:#292D33;
+  --line-strong:#6F6652;
+  --gold:#C9AE75;
+  --gold-deep:#C5AD7C;
+  --on-accent:#1A1711;
+  --calendar-header:#202329;
+  --calendar-range:#343127;
   --plum:#C3A6D8;
   --plum-soft:#2E2839;
   --alert:#DD7A67;
   --alert-soft:#3B241F;
-  --alert-deep:#F0CCC1;
+  --alert-deep:#E59885;
   --teal:#82AEC2;
   --teal-soft:#1D323D;
   --teal-deep:#B3D2DF;
@@ -262,7 +320,10 @@ def _design_css(dark: bool = False, frozen: bool = True) -> str:
   --green-soft:#27331C;
   --green-deep:#DFEBCB;
   --select-fill:#2A2E36;
-  --evt-card-bg:#1A1D22;
+  --evt-card-bg:#202329;
+  --frame-width:2px;
+  --signal-shadow:0 8px 24px -16px rgba(0,0,0,.45);
+  --signal-hover-shadow:0 12px 28px -16px rgba(0,0,0,.55);
   --tracking:.14em;
   --tracking-loose:.22em;
 }
@@ -270,6 +331,7 @@ def _design_css(dark: bool = False, frozen: bool = True) -> str:
     else:
         palette = """
 :root{
+  color-scheme:light;
   --paper:#FDFBF6;
   --paper-2:#F7F2E6;
   --paper-3:#EFE6CC;
@@ -282,6 +344,9 @@ def _design_css(dark: bool = False, frozen: bool = True) -> str:
   --line-strong:#C5A96D;
   --gold:#9B8450;
   --gold-deep:#6B5C38;
+  --on-accent:#FDFBF6;
+  --calendar-header:#F7F2E6;
+  --calendar-range:#EFE6CC;
   --plum:#3D1E50;
   --plum-soft:#E2D2EA;
   --alert:#B03025;
@@ -296,6 +361,9 @@ def _design_css(dark: bool = False, frozen: bool = True) -> str:
   --green-deep:#162310;
   --select-fill:#C5B489;
   --evt-card-bg:#CFE0E6;
+  --frame-width:4px;
+  --signal-shadow:0 1px 0 0 rgba(176,48,37,.05), 0 18px 36px -24px rgba(176,48,37,.35);
+  --signal-hover-shadow:0 2px 0 0 rgba(176,48,37,.07), 0 22px 44px -22px rgba(176,48,37,.45);
   --tracking:.14em;
   --tracking-loose:.22em;
 }
@@ -325,6 +393,11 @@ html, body, [data-testid="stAppViewContainer"], [data-testid="stMain"] {
 }
 [data-testid="stSidebar"] { display: none !important; }
 [data-testid="collapsedControl"] { display: none !important; }
+[data-testid="stCaptionContainer"],
+[data-testid="stCaptionContainer"] p{
+    color:var(--ink-3) !important;
+}
+[data-testid="stWidgetLabel"] p{ color:var(--ink-2) !important; }
 /* Styles du contenu Markdown */
 div[data-testid="stMarkdownContainer"] {
     text-align: left !important;
@@ -352,7 +425,9 @@ div[data-testid="stMarkdownContainer"] h4 {
     color: var(--ink) !important;
 }
 
-/* Round toggle buttons (dark mode + freeze) — uniform style */
+/* Round icon buttons (sources + dark mode + freeze) — uniform style */
+.st-key-nav_apropos button,
+.st-key-nav_veille button,
 .st-key-dark_mode_toggle button,
 .st-key-freeze_toggle button{
     background:var(--paper-2) !important;
@@ -365,6 +440,8 @@ div[data-testid="stMarkdownContainer"] h4 {
     color:var(--ink) !important;
     box-shadow:none !important;
 }
+.st-key-nav_apropos button:hover,
+.st-key-nav_veille button:hover,
 .st-key-dark_mode_toggle button:hover,
 .st-key-freeze_toggle button:hover{
     background:var(--paper-3) !important;
@@ -379,6 +456,7 @@ div[data-testid="stMarkdownContainer"] h4 {
     top:5px !important;
     left:2.5rem !important;
     right:2.5rem !important;
+    width:auto !important;
     max-width:1400px !important;
     margin:0 auto !important;
     z-index:9999 !important;
@@ -392,6 +470,10 @@ div[data-testid="stMarkdownContainer"] h4 {
 /* Le spacer du contenu laisse la place a la barre fixe. */
 [data-testid="stMainBlockContainer"]{
     padding-top:0 !important;
+}
+/* Barre sur 2 lignes (ecrans intermediaires) : decaler le contenu d'autant. */
+@media (min-width: 769px) and (max-width: 1200px){
+    [data-testid="stMainBlockContainer"]{ padding-top:48px !important; }
 }
 """ if frozen else """
 /* Mode LIBERE : 5px du top, espacement natif entre les cadres conserve */
@@ -411,6 +493,33 @@ div[data-testid="stMarkdownContainer"] h4 {
 /* PAS de gap-killer global : les cadres (Signal, Veille x4) gardent leur espacement naturel comme en pinned */
 """) + """
 .st-key-filter-row [data-testid="stHorizontalBlock"] { align-items:center; }
+/* Les icones gardent leur largeur naturelle ; les autres colonnes se partagent le reste. */
+.st-key-filter-row [data-testid="stColumn"]:has(.st-key-icon-row){
+    flex:0 0 auto !important;
+    width:auto !important;
+    min-width:0 !important;
+}
+/* Ecrans intermediaires : date, theme et Retour sur la 1re ligne,
+   MaJ et icones sur la 2e (sinon la barre deborde a droite). */
+@media (min-width: 769px) and (max-width: 1200px){
+    .st-key-filter-row [data-testid="stHorizontalBlock"]{
+        flex-wrap:wrap !important;
+        row-gap:6px !important;
+    }
+    .st-key-filter-row [data-testid="stColumn"]:has(.st-key-period_select){
+        flex:0 0 210px !important; width:210px !important; min-width:0 !important;
+    }
+    .st-key-filter-row [data-testid="stColumn"]:has(.st-key-theme_select){
+        flex:1 1 0 !important; width:auto !important; min-width:0 !important;
+    }
+    .st-key-filter-row [data-testid="stColumn"]:has(.st-key-back_home){
+        flex:0 0 130px !important; width:130px !important; min-width:0 !important;
+    }
+    .st-key-filter-row [data-testid="stColumn"]:has(.st-key-lastupd-box){
+        flex:1 0 calc(100% - 180px) !important; width:auto !important; min-width:0 !important;
+    }
+    .st-key-lastupd-box{ align-items:flex-start !important; }
+}
 
 /* Bump font dans la filterbar (date, themes, toggle) + tout passe en bold */
 .st-key-filter-row,
@@ -514,14 +623,37 @@ div[data-testid="stMarkdownContainer"] h4 {
     white-space:nowrap;
 }
 
-/* Calendar popover : meilleur contraste (jours, semaines, header) */
+/* Calendar : palette coherente jusque dans les couches internes BaseWeb. */
+[data-baseweb="popover"]:has([data-baseweb="calendar"]) > div,
 [data-baseweb="calendar"]{
     background:var(--paper) !important;
     color:var(--ink) !important;
+    transition:none !important;
 }
-[data-baseweb="calendar"] *{ color:var(--ink) !important; }
+/* Le premier enfant contient mois, annee, navigation et jours de semaine. */
+[data-baseweb="calendar"] > div:first-child,
+[data-baseweb="calendar"] > div:first-child > div,
+[data-baseweb="calendar"] div:has(> button[aria-haspopup]),
+[data-baseweb="calendar"] [role="presentation"]{
+    background:var(--calendar-header) !important;
+    color:var(--ink) !important;
+    transition:none !important;
+}
+[data-baseweb="calendar"] button,
+[data-baseweb="calendar"] [role="gridcell"]{
+    color:var(--ink) !important;
+}
+[data-baseweb="calendar"] button{
+    background:transparent !important;
+}
+[data-baseweb="calendar"] button svg{ color:inherit !important; }
+[data-baseweb="calendar"] [role="gridcell"] > div{ color:inherit !important; }
+[data-baseweb="calendar"] button:hover:not(:disabled){
+    background:var(--paper-3) !important;
+}
 [data-baseweb="calendar"] [aria-label*="week"],
-[data-baseweb="calendar"] [role="columnheader"]{
+[data-baseweb="calendar"] [role="columnheader"],
+[data-baseweb="calendar"] [role="presentation"] > div{
     color:var(--ink-2) !important;
     font-weight:700 !important;
 }
@@ -531,9 +663,10 @@ div[data-testid="stMarkdownContainer"] h4 {
 [data-baseweb="calendar"] button[disabled],
 [data-baseweb="calendar"] button[aria-disabled="true"],
 [data-baseweb="calendar"] [aria-label*="outside"],
-[data-baseweb="calendar"] [aria-label*="Outside"]{
+[data-baseweb="calendar"] [aria-label*="Outside"],
+[data-baseweb="calendar"] [role="gridcell"][aria-label^="Not available."]{
     color:var(--ink-4) !important;
-    opacity:.30 !important;
+    opacity:1 !important;
     background:var(--line-soft) !important;
     cursor:not-allowed !important;
     text-decoration:line-through !important;
@@ -547,9 +680,26 @@ div[data-testid="stMarkdownContainer"] h4 {
     background:var(--line-soft) !important;
     transform:none !important;
 }
-[data-baseweb="calendar"] [aria-selected="true"]{
+[data-baseweb="calendar"] [aria-selected="true"],
+[data-baseweb="calendar"] [role="gridcell"][aria-label^="Selected"]{
+    background:transparent !important;
+    color:var(--on-accent) !important;
+}
+[data-baseweb="calendar"] [aria-selected="true"]::after,
+[data-baseweb="calendar"] [role="gridcell"][aria-label^="Selected"]::after{
     background:var(--gold) !important;
-    color:#FDFBF6 !important;
+    border-color:var(--gold) !important;
+}
+[data-baseweb="calendar"] [role="gridcell"]::before{
+    background:var(--calendar-range) !important;
+}
+[data-baseweb="calendar"] [role="gridcell"]:not([aria-label^="Selected"]):not([aria-selected="true"])::after{
+    background:var(--paper-3) !important;
+    border-color:var(--line-strong) !important;
+}
+[data-baseweb="calendar"] :is(button, [role="gridcell"]):focus-visible{
+    outline:2px solid var(--gold) !important;
+    outline-offset:2px;
 }
 [data-baseweb="popover"]{
     background:var(--paper) !important;
@@ -597,37 +747,41 @@ ul[data-testid="stSelectboxVirtualDropdown"],
     color:var(--ink) !important;
 }
 
-/* Bouton navigation Sources / Veille DA — 2 etats bien distincts & visibles */
-/* Base commune (forme, taille) */
-.st-key-nav_apropos button,
-.st-key-nav_veille button{
+/* Bouton Retour (thème ou Sources -> page précédente) : contour gold + fond
+   ambré clair au repos -> remplissage gold + texte crème au survol. */
+.st-key-back_home button{
     border-radius:8px !important;
     font-weight:800 !important;
     min-height:40px !important;
     white-space:nowrap !important;
     box-shadow:0 4px 12px -8px rgba(74,64,48,.45) !important;
     transition:filter .15s ease, background .15s ease, border-color .15s ease, transform .15s ease !important;
-}
-.st-key-nav_apropos button p,
-.st-key-nav_veille button p{ font-weight:800 !important; font-size:14px !important; }
-
-/* Les 2 etats (Sources ET Veille DA) ont le MEME style : contour gold + fond
-   ambré clair au repos -> remplissage gold + texte crème au survol. */
-.st-key-nav_apropos button,
-.st-key-nav_veille button{
     background:var(--paper-3) !important;
     border:1.5px solid var(--gold-deep) !important;
 }
-.st-key-nav_apropos button p,
-.st-key-nav_veille button p{ color:var(--gold-deep) !important; }
-.st-key-nav_apropos button:hover,
-.st-key-nav_veille button:hover{
+.st-key-back_home button p{ font-weight:800 !important; font-size:14px !important; color:var(--gold-deep) !important; }
+.st-key-back_home button:hover{
     background:var(--gold-deep) !important;
     border-color:var(--gold-deep) !important;
     transform:translateY(-1px) !important;
 }
-.st-key-nav_apropos button:hover p,
-.st-key-nav_veille button:hover p{ color:var(--paper) !important; }
+.st-key-back_home button:hover p{ color:var(--paper) !important; }
+/* Page de garde : Retour visible mais inactif */
+.st-key-back_home button:disabled{
+    opacity:.45 !important;
+    cursor:default !important;
+    box-shadow:none !important;
+}
+.st-key-back_home button:disabled:hover{
+    background:var(--paper-3) !important;
+    transform:none !important;
+}
+.st-key-back_home button:disabled:hover p{ color:var(--gold-deep) !important; }
+/* Icône Sources active (page Sources ouverte) */
+.st-key-nav_veille button{
+    background:var(--paper-3) !important;
+    border:1.5px solid var(--gold-deep) !important;
+}
 .st-key-filter-row [data-baseweb="select"] {
     background:var(--paper) !important;
     border-color:var(--line) !important;
@@ -641,20 +795,21 @@ ul[data-testid="stSelectboxVirtualDropdown"],
    secondaryBackgroundColor beige de config.toml (statique) -> illisible en
    dark mode. --select-fill suit la palette (light = beige identique, dark =
    charbon). Concerne le selectbox thème + les filtres du dialog Concurrentielle. */
-.st-key-filter-row [data-baseweb="select"] > div,
-.st-key-con_ptype_filter [data-baseweb="select"] > div,
-.st-key-con_pcat_filter [data-baseweb="select"] > div{
+[data-baseweb="select"] > div{
     background:var(--select-fill) !important;
     border-color:var(--line-strong) !important;
+    color:var(--ink) !important;
     /* transition:none INDISPENSABLE : BaseWeb relance sa transition
        background-color en boucle (running@0ms perpetuel) -> l'ecran reste fige
        sur la couleur de DEPART (beige du theme statique) et nos regles,
        pourtant gagnantes en cascade, ne s'affichent jamais. */
     transition:none !important;
 }
-.st-key-filter-row [data-baseweb="select"] svg,
-.st-key-con_ptype_filter [data-baseweb="select"] svg,
-.st-key-con_pcat_filter [data-baseweb="select"] svg{
+[data-baseweb="select"] [value],
+[data-baseweb="select"] input{
+    color:var(--ink) !important;
+}
+[data-baseweb="select"] svg{
     fill:var(--ink-2) !important;
 }
 /* Multiselect tags as chips */
@@ -684,15 +839,15 @@ ul[data-testid="stSelectboxVirtualDropdown"],
     height:36px !important;
 }
 
-/* ────────── SIGNAL DU JOUR (full width) ────────── */
+/* ────────── SIGNAL (full width) ────────── */
 .signal{
     position:relative;
-    border:4px solid var(--alert);
+    border:var(--frame-width) solid var(--alert);
     border-radius:14px;
     background:linear-gradient(135deg, var(--alert-soft) 0%, var(--paper) 60%);
     padding:22px 28px 22px 32px;
     margin-bottom:24px;
-    box-shadow:0 1px 0 0 rgba(176,48,37,.05), 0 18px 36px -24px rgba(176,48,37,.35);
+    box-shadow:var(--signal-shadow);
     overflow:hidden;
     display:flex; gap:20px; align-items:stretch;
     transition:transform 160ms ease, box-shadow 160ms ease, border-color 160ms ease;
@@ -700,7 +855,7 @@ ul[data-testid="stSelectboxVirtualDropdown"],
 .signal:hover{
     transform:translateY(-1px);
     border-color:var(--alert-deep) !important;
-    box-shadow:0 2px 0 0 rgba(176,48,37,.07), 0 22px 44px -22px rgba(176,48,37,.45) !important;
+    box-shadow:var(--signal-hover-shadow) !important;
 }
 .signal::before{
     content:""; position:absolute; left:0; top:0; bottom:0; width:5px;
@@ -763,7 +918,7 @@ ul[data-testid="stSelectboxVirtualDropdown"],
 .st-key-cadre-evt,
 .st-key-cadre-con {
     position:relative;
-    border:4px solid var(--line-strong) !important;
+    border:var(--frame-width) solid var(--line-strong) !important;
     border-radius:14px !important;
     background:var(--paper) !important;
     box-shadow:0 1px 0 0 rgba(74,64,48,.04), 0 14px 30px -22px rgba(74,64,48,.35) !important;
@@ -1043,86 +1198,72 @@ div[role="dialog"][aria-modal="true"]{
 }
 .scout-expander-link:hover { color:var(--gold); text-decoration:underline; }
 
-/* ────────── LANDING : boutons de thème (dégradé + emoji filigrane) ────────── */
-/* Base commune. Le dégradé de fond + l'emoji filigrane (::after) sont injectés
-   dynamiquement par thème (couleur dédiée) dans le bloc landing. */
+/* Cadres cliquables : thème, niveau, titre, résumé court, accès au détail. */
 [class*="st-key-theme_btn_"] button{
-    position:relative !important;          /* ancre le filigrane ::after */
-    overflow:hidden !important;            /* clippe le filigrane */
+    position:relative !important;
+    overflow:hidden !important;
     border:1.5px solid var(--gold-deep) !important;
     border-radius:16px !important;
-    min-height:155px !important;
-    padding:16px 18px !important;
-    display:flex !important; align-items:center !important; justify-content:center !important;
+    height:100% !important; min-height:250px !important;
+    padding:16px 20px !important;
+    display:flex !important; align-items:stretch !important; justify-content:flex-start !important;
     white-space:normal !important;
-    text-align:center !important;
+    text-align:left !important;
     box-shadow:0 6px 18px -14px rgba(74,64,48,.35) !important;
     transition:transform .15s ease, box-shadow .15s ease, border-color .15s ease, background .25s ease !important;
 }
 [class*="st-key-theme_btn_"] button:hover{
-    transform:translateY(-4px) !important;
+    transform:translateY(-2px) !important;
     box-shadow:0 18px 34px -16px rgba(74,64,48,.55) !important;
     border-color:var(--gold-deep) !important;
 }
-[class*="st-key-theme_btn_"] button p{
-    position:relative !important; z-index:1 !important;   /* texte au-dessus du filigrane */
-    font-family:"Inter" !important; font-weight:800 !important;
-    font-size:21px !important; line-height:1.4 !important;
-    color:var(--ink) !important;
-    text-align:center !important;
-    text-shadow:0 1px 3px var(--paper) !important;        /* lisibilité sur le dégradé */
+.st-key-theme-picker button [data-testid="stMarkdownContainer"]{
+    position:relative; z-index:1; width:100%; display:flex; flex-direction:column; gap:7px;
 }
-
+.st-key-theme-picker button p{
+    position:relative !important; z-index:1 !important;
+    font-family:"Inter" !important; font-weight:400 !important;
+    font-size:13px !important; line-height:1.45 !important; margin:0 !important;
+    color:var(--ink) !important;
+    text-align:left !important;
+    overflow-wrap:anywhere;
+}
+.st-key-theme-picker button p:first-child{ font-size:18px !important; line-height:1.3 !important; min-height:44px; }
+.st-key-theme-picker button p:nth-child(2){ font-size:11px !important; color:var(--ink-3) !important; font-weight:700 !important; }
+.st-key-theme-picker button p:nth-child(3){ font-size:14px !important; }
+.st-key-theme-picker button p:nth-child(4){ color:var(--ink-2) !important; }
+.st-key-theme-picker button p:nth-child(3),
+.st-key-theme-picker button p:nth-child(4){
+    display:-webkit-box; -webkit-box-orient:vertical; overflow:hidden;
+}
+.st-key-theme-picker button p:nth-child(3){ -webkit-line-clamp:2; }
+.st-key-theme-picker button p:nth-child(4){ -webkit-line-clamp:3; }
+.st-key-theme-picker button p:last-child{ margin-top:auto !important; padding-top:4px; font-size:12px !important; font-weight:700 !important; color:var(--gold-deep) !important; }
 .st-key-theme-picker{
     display:grid !important;
-    grid-template-columns:minmax(0, 1fr) minmax(0, 1.25fr) minmax(0, 1fr) !important;
-    gap:18px 24px !important;
-    align-items:center !important;
+    grid-template-columns:repeat(3, minmax(0, 1fr)) !important;
+    grid-auto-rows:1fr;
+    gap:14px 20px !important;
+    align-items:stretch !important;
 }
-.st-key-theme-picker > [data-testid="stLayoutWrapper"]:has(> .st-key-featured-theme){
-    grid-column:2; grid-row:1; min-width:0;
-}
-.st-key-featured-theme .stButton button{
-    min-height:210px !important;
-    border:2px solid var(--teal) !important;
-    background:linear-gradient(135deg, var(--teal-soft), var(--paper)) !important;
-    box-shadow:0 9px 24px -16px var(--teal) !important;
-    padding:24px !important;
-}
-.st-key-featured-theme .stButton button:hover{
-    border-color:var(--teal-deep) !important;
-    box-shadow:0 14px 28px -16px var(--teal) !important;
-}
-.st-key-featured-theme button p{
-    font-size:14px !important; font-weight:500 !important;
-    color:var(--teal-deep) !important; margin:0 !important;
-    text-align:center !important;
-}
-.st-key-featured-theme button strong{
-    display:block; font-size:26px; font-weight:800; line-height:1.25;
-    color:var(--ink); margin-bottom:10px; letter-spacing:0;
+.st-key-theme-picker > [data-testid="stLayoutWrapper"],
+.st-key-theme-picker [data-testid="stButton"]{
+    height:100%; min-width:0;
 }
 @media (min-width: 601px) and (max-width: 1000px){
     .st-key-theme-picker{ grid-template-columns:repeat(2, minmax(0, 1fr)) !important; }
-    .st-key-theme-picker > [data-testid="stLayoutWrapper"]:has(> .st-key-featured-theme){
-        grid-column:1 / -1; grid-row:1;
-    }
-    .st-key-featured-theme .stButton button{ min-height:180px !important; }
 }
 @media (max-width: 600px){
     .st-key-theme-picker{ grid-template-columns:minmax(0, 1fr) !important; gap:12px !important; }
-    .st-key-theme-picker > [data-testid="stLayoutWrapper"]:has(> .st-key-featured-theme){
-        grid-column:1; grid-row:1;
-    }
-    .st-key-featured-theme .stButton button{ min-height:180px !important; padding:20px !important; }
-    .st-key-featured-theme button strong{ font-size:24px; }
+    .st-key-theme-picker button{ min-height:250px !important; padding:16px 18px !important; }
 }
 
-/* Sources section heading (compact : plus de <br> ni de trait separateur) */
+/* Sources : laisser respirer le titre sous la barre supérieure. */
 .sources-heading{
     font-family:"Cinzel", serif !important; font-weight:700 !important; font-size:20px !important;
     letter-spacing:.14em !important; text-transform:uppercase !important; color:var(--ink) !important;
     text-align:center; margin:8px 0 14px;
+    padding-top:32px;
 }
 .sources-heading small{
     display:block; font-family:"Cormorant Garamond", serif !important; font-style:italic;
@@ -1194,9 +1335,10 @@ table.sources-table{
     box-shadow:0 2px 8px -4px rgba(74,64,48,.18) !important;
     transition:background 160ms ease, color 160ms ease, border-color 160ms ease, transform 160ms ease;
 }
+.st-key-dl_sources_xlsx button p{ color:inherit !important; }
 .st-key-dl_sources_xlsx button:hover{
     background:var(--gold) !important;
-    color:#FDFBF6 !important;
+    color:var(--on-accent) !important;
     border-color:var(--gold-deep) !important;
     transform:translateY(-1px) !important;
 }
@@ -1221,7 +1363,7 @@ table.sources-table{
     height:200px !important;
     border-radius:50% !important;
     background:linear-gradient(135deg, var(--teal-soft) 0%, var(--paper) 90%) !important;
-    border:4px solid var(--teal) !important;
+    border:var(--frame-width) solid var(--teal) !important;
     color:var(--ink) !important;
     font-family:"Cinzel", serif !important;
     font-weight:700 !important;
@@ -1280,7 +1422,7 @@ table.sources-table{
     height:200px !important;
     border-radius:50% !important;
     background:linear-gradient(135deg, var(--green-soft) 0%, var(--paper) 90%) !important;
-    border:4px solid var(--green) !important;
+    border:var(--frame-width) solid var(--green) !important;
     color:var(--ink) !important;
     font-family:"Cinzel", serif !important;
     font-weight:700 !important;
@@ -1446,9 +1588,9 @@ table.sources-table{
        topbar et le contenu. display:none retire le slot ; les <style> restent actifs
        (métadonnées non affectées par le display) et les iframes JS continuent de
        s'exécuter (toujours présents dans le DOM). */
-    [data-testid="stElementContainer"]:has(style),
+    [data-testid="stElementContainer"]:has(style):not(:has(.scout-loading)),
     [data-testid="stElementContainer"]:has(iframe),
-    .element-container:has(style),
+    .element-container:has(style):not(:has(.scout-loading)),
     .element-container:has(iframe){
         display:none !important;
     }
@@ -1472,6 +1614,9 @@ table.sources-table{
         top:auto !important;
         left:auto !important;
         right:auto !important;
+        width:100% !important;
+        max-width:100% !important;
+        box-sizing:border-box !important;
         padding:10px 12px !important;
         z-index:auto !important;
         border-radius:10px !important;
@@ -1492,14 +1637,27 @@ table.sources-table{
 
     /* Cacher le bouton freeze sur mobile (filterbar deja en flow) */
     .st-key-freeze_toggle{ display:none !important; }
-    /* Compresser legerement dark mode toggle */
-    .st-key-dark_mode_toggle button{
-        padding:4px 8px !important;
-        min-width:38px !important;
-        min-height:38px !important;
-    }
 
-    /* ── Signal du jour : compact + retirer le "!" pour gagner de l'espace ── */
+    /* Disposition telephone : date, theme et Retour sur toute la largeur,
+       puis MaJ a gauche et icones a droite sur une meme ligne. */
+    .st-key-filter-row [data-testid="stColumn"]{
+        flex:1 1 100% !important;
+        width:100% !important;
+        min-width:100% !important;
+    }
+    .st-key-filter-row [data-testid="stColumn"]:has(.st-key-lastupd-box){
+        flex:1 1 0 !important;
+        width:auto !important;
+        min-width:0 !important;
+    }
+    .st-key-filter-row [data-testid="stColumn"]:has(.st-key-icon-row){
+        flex:0 0 auto !important;
+        width:auto !important;
+        min-width:0 !important;
+    }
+    .st-key-lastupd-box{ align-items:flex-start !important; }
+
+    /* ── Signal : compact + retirer le "!" pour gagner de l'espace ── */
     .signal{
         padding:16px 14px !important;
         gap:12px !important;
@@ -1632,7 +1790,7 @@ table.sources-table{
     }
 
     /* ── Sources table : scroll horizontal natif Streamlit + heading compact ── */
-    .sources-heading{ font-size:17px !important; }
+    .sources-heading{ font-size:17px !important; padding-top:8px; }
     .sources-heading small{ font-size:11px !important; }
 
     /* ── Dialog scout summary : font lisible ── */
@@ -1804,6 +1962,27 @@ def _show_veille_details(veille, group, selected_themes, calendar_events=None):
     closed_text = "--ink" if is_dark else border_var
     open_body_bg = "--paper" if is_dark else "--paper-2"
 
+    # Les tags Markdown (code inline) gardent sinon le fond blanc de Streamlit.
+    tag_css = """
+[data-testid="stDialog"] [data-testid="stExpander"] summary code{
+    background:var(--green-soft) !important;
+    color:var(--green-deep) !important;
+    border:1px solid var(--green) !important;
+    border-radius:6px;
+    padding:3px 8px;
+    font-family:"Inter", sans-serif;
+    font-size:12px;
+    font-weight:600;
+    letter-spacing:.03em;
+    line-height:1.5;
+    box-decoration-break:clone;
+    -webkit-box-decoration-break:clone;
+}
+[data-testid="stDialog"] [data-testid="stExpander"] summary code span{
+    color:inherit !important;
+}
+""" if is_dark and tone == "con" else ""
+
     # CSS scope par tone : variables CSS pour adaptation auto light/dark
     st.markdown(
         f"""<style>
@@ -1853,6 +2032,7 @@ def _show_veille_details(veille, group, selected_themes, calendar_events=None):
     color:var({border_var}) !important;
     border-bottom-color:var({border_var}) !important;
 }}
+{tag_css}
 </style>""",
         unsafe_allow_html=True,
     )
@@ -1978,7 +2158,7 @@ def _show_veille_details(veille, group, selected_themes, calendar_events=None):
         for _, row in theme_sorted.iterrows():
             date_str = _format_date_fr(row.get("Date"))
             title = str(row.get("Title", "")).strip()
-            source = str(row.get("Website_name", "")).strip()
+            source = article_source_name(row)
             desc = str(row.get("Description", "")).strip()
             link = str(row.get("Link", "")).strip()
 
@@ -2155,7 +2335,7 @@ _DAIRY_OWN_BRANDS = ("chergui", "domaines agricoles", "les domaines agricoles", 
 _DAIRY_SOURCE_CATEGORY = {
     # C1 — Marché local & Maghreb
     "GNews — Presse éco MA": _CAT_MARCHE_LOCAL, "La Vie Éco": _CAT_MARCHE_LOCAL,
-    "Le Matin": _CAT_MARCHE_LOCAL, "EcoActu": _CAT_MARCHE_LOCAL,
+    "Le Matin": _CAT_MARCHE_LOCAL,
     "Aujourd'hui Maroc": _CAT_MARCHE_LOCAL,
     "GNews — Centrale Danone": _CAT_MARCHE_LOCAL, "GNews — COPAG Jaouda": _CAT_MARCHE_LOCAL,
     "GNews — Lesieur Cristal": _CAT_MARCHE_LOCAL,
@@ -2215,11 +2395,11 @@ _AGRUMES_COMPETITORS = (
 _AGRUMES_OWN_BRANDS = ("les domaines agricoles", "domaines agricoles")
 _AGRUMES_SOURCE_CATEGORY = {
     # A1 — Marché Maroc
-    "GNews — Agrumes Export MA": _ACAT_MARCHE, "EcoActu": _ACAT_MARCHE,
+    "GNews — Agrumes Export MA": _ACAT_MARCHE,
     "Aujourd'hui Maroc": _ACAT_MARCHE,
     # A2 — Export & marchés internationaux
     "GNews — Marché Agrumes Intl": _ACAT_EXPORT, "GNews — Marché Fruits Rouges": _ACAT_EXPORT,
-    "FreshPlaza FR": _ACAT_EXPORT, "Agro-media": _ACAT_EXPORT, "FruitNet": _ACAT_EXPORT,
+    "FreshPlaza FR": _ACAT_EXPORT,
     "FreshFruitPortal": _ACAT_EXPORT, "Financial Afrik": _ACAT_EXPORT,
     # A3 — Concurrents
     "GNews — Concurrents Primeurs": _ACAT_CONCURRENTS,
@@ -2336,7 +2516,7 @@ def _render_veille_dashboard(filtered_df, selected_themes, upcoming_events, star
 
 
 def _render_veille_contents(filtered_df, selected_themes, upcoming_events, start_date, signal_html_body):
-    # ── ROW 1 : Cercle Concurrentielle | Signal du jour (centre) | Cercle Evenementielle ──
+    # ── ROW 1 : Cercle Concurrentielle | Signal (centre) | Cercle Evenementielle ──
     selected_veille = st.session_state.get("scout_selected_veille")
     n_events = len(upcoming_events)
 
@@ -2460,22 +2640,6 @@ def _render_veille_contents(filtered_df, selected_themes, upcoming_events, start
 
 
 
-# ─── UI STATE (dark mode + filterbar freeze + vue active) ────────────────────
-if "dark_mode" not in st.session_state:
-    # Restaure la préférence depuis le COOKIE navigateur (persiste entre les
-    # sessions : un user qui a activé le dark mode le retrouve en revenant).
-    # Le cookie est écrit par le bloc JS de synchronisation en fin de script ;
-    # st.context.cookies le lit au chargement. Fallback : mode clair.
-    try:
-        st.session_state["dark_mode"] = st.context.cookies.get("scout_dark") == "1"
-    except Exception:
-        st.session_state["dark_mode"] = False
-if "filterbar_frozen" not in st.session_state:
-    st.session_state["filterbar_frozen"] = True
-# Vue active : "veille" (tableau de bord, par defaut) ou "apropos" (page Sources)
-if "scout_view" not in st.session_state:
-    st.session_state["scout_view"] = "veille"
-
 
 def _toggle_dark_mode():
     st.session_state["dark_mode"] = not st.session_state.get("dark_mode", False)
@@ -2498,6 +2662,176 @@ def _select_theme(theme: str):
     st.session_state["scout_view"] = "veille"
 
 
+def _go_home():
+    # Bouton Retour : quitte la page Sources, sinon deselectionne le theme
+    # pour revenir a la page de garde.
+    if st.session_state.get("scout_view", "veille") != "veille":
+        st.session_state["scout_view"] = "veille"
+    else:
+        st.session_state["theme_select"] = None
+
+
+
+def _signal_context_for_view(filtered_df, selected_themes, period):
+    cache = st.session_state.setdefault("scout_signal_context_cache", {})
+    key = (_slot, media_data_df.attrs.get("collected_at"), tuple(selected_themes), tuple(period))
+    if key in cache:
+        return cache[key]
+    con_theme = _con_theme(selected_themes)
+    candidates = filtered_df
+    if con_theme and not filtered_df.empty:
+        candidates = filtered_df[filtered_df.apply(
+            lambda row: row["Veille"] != "Veille Concurrentielle"
+            or _article_mentions_competitor(row, con_theme), axis=1,
+        )]
+    pool = select_signal_candidates(candidates, selected_themes)
+    context = tuple(
+        " | ".join(part for part in [
+            f"Titre: {str(row.get('Title', '')).strip()}",
+            f"Source: {str(row.get('Website_name', '')).strip()}",
+            f"Date: {_format_date_fr(row.get('Date'))}",
+            f"Theme: {_theme_display(str(row.get('Theme', '')).strip())}",
+            f"Veille: {_veille_display(str(row.get('Veille', '')).strip())}",
+            f"Resume: {str(row.get('Description', '')).strip()}",
+            f"Lien: {str(row.get('Link', '')).strip()}",
+        ] if part and not part.endswith(": "))
+        for _, row in pool.iterrows()
+    )
+    cache[key] = context, _latest_article(pool if not pool.empty else candidates)
+    while len(cache) > 16:
+        del cache[next(iter(cache))]
+    return cache[key]
+
+
+def _articles_for_period(period, themes=None):
+    start, end = period
+    mask = (
+        (media_data_df["Date"] >= pd.Timestamp(start))
+        & (media_data_df["Date"] < pd.Timestamp(end) + pd.Timedelta(days=1))
+    )
+    if themes is not None:
+        mask &= media_data_df["Theme"].isin(themes)
+    return media_data_df[mask]
+
+
+def _latest_article(articles):
+    """Dernier recours d'un cadre sans Signal : l'actualité la plus récente du thème."""
+    if articles.empty:
+        return None
+    row = articles.sort_values("Date", ascending=False).iloc[0]
+    return {
+        "title": " ".join(str(row.get("Title", "")).split()),
+        "source": str(row.get("Website_name", "")).strip(),
+        "date": _format_date_fr(row.get("Date")),
+        "link": str(row.get("Link", "")).strip(),
+    }
+
+
+def _prepare_signals(period):
+    """Un instantané partagé par l'accueil et tous les thèmes, dès le chargement."""
+    key = ("signals-v3", _slot, media_data_df.attrs.get("collected_at"), tuple(period))
+    snapshot = st.session_state.get("scout_signals_snapshot")
+    if snapshot and snapshot["key"] == key:
+        cache = st.session_state.get("scout_signal_cache", {})
+        expired = any(
+            snapshot["signals"][theme].get("retryable")
+            and cache.get(("signals-v3", _slot, context), (0,))[0] <= monotonic()
+            for theme, context in snapshot["contexts"].items()
+        )
+        if not expired:
+            return snapshot
+    period_df = _articles_for_period(period)
+    contexts, latest = {}, {}
+    for theme in MEDIA_SCOUT_THEMES:
+        theme_df = period_df[period_df["Theme"] == theme]
+        if not theme_df.empty:
+            contexts[theme], latest[theme] = _signal_context_for_view(theme_df, [theme], period)
+    signals = _session_signals(contexts)
+    signals = {theme: signals.get(theme, {"available": False, "reason": "no_articles"}) for theme in MEDIA_SCOUT_THEMES}
+    snapshot = {"key": key, "contexts": contexts, "signals": signals, "latest": latest}
+    st.session_state["scout_signals_snapshot"] = snapshot
+    retries = [st.session_state["scout_signal_cache"][("signals-v3", _slot, contexts[theme])][0]
+               for theme, signal in signals.items() if signal.get("retryable") and theme in contexts]
+    st.session_state["scout_signals_retry_at"] = min(retries) if retries else None
+    return snapshot
+
+
+
+def _card_text(value):
+    """L'actualité reste du texte, y compris dans un libellé Markdown de bouton."""
+    return re.sub(r'([\\`*_{}\[\]()#+.!|<>~\-])', r'\\\1', " ".join(str(value).split()))
+
+
+def _render_theme_card(theme, index, signal, latest=None):
+    # La page de garde ne montre que le titre ; le résumé reste sur la page du thème.
+    available = signal.get("available") and signal.get("headline")
+    if available:
+        level = "Prioritaire" if signal.get("level") == "priority" else "À la une"
+        headline = shorten(signal["headline"], width=145, placeholder="…")
+        summary = ""
+    elif latest and not signal.get("retryable"):
+        level = "À la une"
+        headline = shorten(latest["title"], width=145, placeholder="…")
+        summary = ""
+    else:
+        if signal.get("retryable"):
+            level = "Analyse temporairement indisponible"
+            headline = "Résumé temporairement indisponible"
+            minutes = max(1, (signal.get("retry_after_seconds", 60) + 59) // 60)
+            delay = "environ une minute" if minutes == 1 else f"environ {minutes} minutes"
+            cause = ""
+            if signal.get("failure_kind") == "rate_limit":
+                cause = ("Limite d’accès au site source atteinte. " if signal.get("failure_stage") == "article"
+                         else "Limite de débit ou quota IA atteint. ")
+            summary = f"{cause}Nouvelle tentative automatique dans {delay}."
+        elif signal.get("failure_kind") and signal.get("failure_stage") != "article":
+            level = "Analyse indisponible"
+            headline = "Résumé indisponible"
+            summary = "Le service IA n’a pas pu traiter ces articles. Consultez les actualités du thème."
+        elif signal.get("reason") in {"source_unavailable", "insufficient_content", "summary_unavailable"}:
+            level = "Résumé indisponible"
+            headline = "Texte source inaccessible ou insuffisant"
+            summary = "Les extraits disponibles ne permettent pas de rédiger un résumé fiable. Consultez les articles du thème."
+        elif signal.get("failure_kind"):
+            level = "Analyse indisponible"
+            headline = "Résumé indisponible"
+            summary = "Le service IA n’a pas pu traiter ces articles. Consultez les actualités du thème."
+        else:
+            level = "Aucun signal"
+            headline = "Aucune actualité à mettre en avant"
+            summary = "Les informations disponibles sur cette période ne permettent pas de retenir un signal documenté."
+    summary = f"{_card_text(summary)}\n\n" if summary else ""
+    label = (f"**{_card_text(_theme_plain(theme))}**\n\n{level}\n\n"
+             f"**{_card_text(headline)}**\n\n{summary}Voir le thème →")
+    st.button(label, key=f"theme_btn_{index}", on_click=_select_theme, args=(theme,), width="stretch")
+
+
+# La période mémorisée est disponible avant la création des filtres.
+today = _datetime_maroc().date()
+days_ago = today - timedelta(days=6)
+earliest_date = today - timedelta(days=15)
+date_select = st.session_state.get("period_select", (days_ago, today))
+# Les bornes du calendrier changent à minuit : conserver la sélection encore
+# valide, ou revenir à la période récente si elle sort de la fenêtre autorisée.
+if isinstance(date_select, tuple) and any(
+    isinstance(day, date) and not earliest_date <= day <= today for day in date_select
+):
+    date_select = (days_ago, today)
+    st.session_state.pop("period_select", None)
+
+# Tous les thèmes sont analysés au chargement et après une actualisation ou un
+# changement de période, même lorsqu'un thème est déjà sélectionné.
+invalid_period = (
+    not isinstance(date_select, tuple)
+    or len(date_select) != 2
+    or any(d is None or d == "" for d in date_select)
+)
+try:
+    signal_analysis = _prepare_signals(date_select) if not invalid_period else None
+except Exception:
+    _loading_status.empty()
+    raise
+
 # ─── Inject design CSS (palette + filterbar mode) ─────────────────────────────
 st.markdown(
     _design_css(
@@ -2508,22 +2842,24 @@ st.markdown(
 )
 
 
-# ─── FILTERBAR (période | thèmes | MàJ | Sources/Veille DA | dark | freeze) ─
+# ─── FILTERBAR (période | thèmes | Retour | MàJ | sources · dark · freeze) ──
+# Retour reste en place pour une barre stable ; il est inactif sur la page de garde.
+_cur_view = st.session_state.get("scout_view", "veille")
+_can_go_back = _cur_view != "veille" or bool(st.session_state.get("theme_select"))
 with st.container(key="filter-row"):
-    fb_cols = st.columns([1.6, 5.0, 1.5, 1.2, 0.5, 0.5], gap="small", vertical_alignment="center")
+    fb_cols = st.columns([1.6, 5.0, 1.2, 1.5, 1.4], gap="small", vertical_alignment="center")
+    _back_col = fb_cols.pop(2)
 
     with fb_cols[0]:
-        today = _datetime_maroc().date()
-        # today-4 -> plage de 5 jours CALENDAIRES inclus (ex: 31/05 -> 04/06)
-        days_ago = today - timedelta(days=4)
         date_select = st.date_input(
             label="Période",
-            value=(days_ago, today),
+            value=date_select,
+            key="period_select",
             max_value=today,
-            min_value=today - timedelta(days=15),
+            min_value=earliest_date,
             label_visibility="collapsed",
             format="DD/MM/YYYY",
-            help="Période (max 15 jours, défaut 5 jours)",
+            help="Période (max 15 jours, défaut 7 jours)",
         )
 
     with fb_cols[1]:
@@ -2541,9 +2877,15 @@ with st.container(key="filter-row"):
         # Compat retro : le reste du code attend une liste, on en encapsule la valeur unique
         selected_themes = [selected_theme] if selected_theme else []
 
+    with _back_col:
+        st.button("← Retour", key="back_home", on_click=_go_home, width="stretch",
+                  disabled=not _can_go_back,
+                  help="Revenir à la page de garde" if _cur_view == "veille"
+                  else "Revenir au tableau de bord de veille")
+
     with fb_cols[2]:
         # Dernière mise à jour automatique des données (créneaux 07h / 19h, heure Maroc)
-        _last_upd = format_last_update(media_data_df.attrs.get("collected_at"))
+        _last_upd = format_last_update(media_data_df.attrs.get("collected_at")) or "Indisponible"
         with st.container(key="lastupd-box"):
             st.markdown(
                 '<div class="last-update" '
@@ -2554,39 +2896,26 @@ with st.container(key="filter-row"):
                 unsafe_allow_html=True,
             )
 
-    with fb_cols[3]:
-        # Bouton de navigation : libelle = la vue VERS laquelle on bascule.
-        # Cle distincte par etat -> styles CSS differents (contour vs rempli).
-        # Vue "veille" (defaut) -> bouton "Sources" | Vue "apropos" -> "Veille DA"
-        _cur_view = st.session_state.get("scout_view", "veille")
-        if _cur_view == "veille":
-            st.button(
-                "Sources",
-                key="nav_apropos",
-                help="Consulter les sources de référence de la veille",
-                on_click=_toggle_view,
-                width="stretch",
-            )
-        else:
-            st.button(
-                "Veille DA",
-                key="nav_veille",
-                help="Revenir au tableau de bord de veille",
-                on_click=_toggle_view,
-                width="stretch",
-            )
-
-    with fb_cols[4]:
+    with fb_cols[3], st.container(key="icon-row", horizontal=True,
+                                  horizontal_alignment="right", vertical_alignment="center"):
+        # Icône Sources : clé distincte par état -> l'icône reste cerclée d'or
+        # tant que la page Sources est ouverte.
+        st.button(
+            "📚",
+            key="nav_apropos" if _cur_view == "veille" else "nav_veille",
+            help=("Consulter les sources de référence de la veille" if _cur_view == "veille"
+                  else "Revenir au tableau de bord de veille"),
+            on_click=_toggle_view,
+            width="content",
+        )
         _is_dark = st.session_state.get("dark_mode", False)
         st.button(
             "☀️" if _is_dark else "🌙",
             key="dark_mode_toggle",
             help="Basculer mode sombre / clair",
             on_click=_toggle_dark_mode,
-            width="stretch",
+            width="content",
         )
-
-    with fb_cols[5]:
         _is_frozen = st.session_state.get("filterbar_frozen", True)
         st.button(
             "📌" if _is_frozen else "📍",
@@ -2594,7 +2923,7 @@ with st.container(key="filter-row"):
             help=("Libérer la barre — elle redeviendra défilante" if _is_frozen
                   else "Figer la barre en haut de page"),
             on_click=_toggle_freeze,
-            width="stretch",
+            width="content",
         )
 
 # ─── JS Bridge : griser les dates hors plage dans le calendrier ──────────────
@@ -2665,7 +2994,7 @@ components.html(
 
       function applyGrey(btn, dt){{
         if (dt < minDate || dt > today) {{
-          btn.style.setProperty('opacity', '0.30', 'important');
+          btn.style.setProperty('opacity', '1', 'important');
           btn.style.setProperty('background', 'var(--line-soft)', 'important');
           btn.style.setProperty('color', 'var(--ink-4)', 'important');
           btn.style.setProperty('cursor', 'not-allowed', 'important');
@@ -2709,8 +3038,16 @@ components.html(
     height=0,
 )
 
-
 # ─── CONTENT ──────────────────────────────────────────────────────────────────
+if media_data_df.attrs.get("collection_status") in {"stale", "unavailable"}:
+    _collection_message = (
+        "Actualisation momentanément indisponible. Les dernières données sont conservées. "
+        "Nouvelle tentative automatique dans une minute."
+        if not media_data_df.empty else
+        "Actualisation momentanément indisponible. Nouvelle tentative automatique dans une minute."
+    )
+    st.warning(_collection_message, icon=":material/sync_problem:")
+
 # Vue par defaut = "veille" (tableau de bord actif des l'ouverture, sans toggle).
 # La page "apropos" (Sources) s'affiche uniquement via le bouton « Sources ».
 if st.session_state.get("scout_view", "veille") == "veille":
@@ -2718,11 +3055,6 @@ if st.session_state.get("scout_view", "veille") == "veille":
     with st.container(key="veille-top-spacer"):
         st.markdown("<br>", unsafe_allow_html=True)
 
-    invalid_period = (
-        not isinstance(date_select, tuple)
-        or len(date_select) != 2
-        or any(d is None or d == "" for d in date_select)
-    )
     issues = []
     if not selected_themes:
         issues.append("un thème")
@@ -2730,14 +3062,10 @@ if st.session_state.get("scout_view", "veille") == "veille":
         issues.append("une période valide (date début + date fin)")
 
     if issues:
-        # Landing visuel : grands boutons (1 par thème) avec dégradé de couleur
-        # dédié + emoji en filigrane. Au clic, le thème est pré-sélectionné et le
-        # tableau de bord s'affiche. Le theme Normes est mis en avant au centre.
-        # Espace haut (br) masqué en mobile via .st-key-landing-top-spacer (CSS).
-        with st.container(key="landing-top-spacer"):
-            st.markdown("<br>", unsafe_allow_html=True)
+        if invalid_period:
+            st.info("Choisissez une date de début et une date de fin pour consulter les signaux.")
 
-        # CSS dynamique par thème : dégradé de fond (repos + hover) + filigrane emoji
+        # Six cadres identiques, dans l'ordre historique : Normes en bas à droite.
         _btn_visual_css = "<style>"
         for _bi, _bt in enumerate(MEDIA_SCOUT_THEMES):
             _c = _THEME_COLORS.get(_bt, "#A89060")
@@ -2748,41 +3076,22 @@ if st.session_state.get("scout_view", "veille") == "veille":
                 f".st-key-theme_btn_{_bi} button:hover{{"
                 f"background:linear-gradient(135deg, {_c}66 0%, {_c}2E 52%, var(--paper-3) 100%) !important;}}"
                 f".st-key-theme_btn_{_bi} button::after{{"
-                f"content:'{_em}'; position:absolute; right:-6px; bottom:-26px;"
-                f"font-size:104px; line-height:1; opacity:.18; z-index:0;"
+                f"content:'{_em}'; position:absolute; right:10px; bottom:4px;"
+                f"font-size:92px; line-height:1; opacity:.10; z-index:0;"
                 f"pointer-events:none; transform:rotate(-6deg);}}"
-                f".st-key-theme_btn_{_bi} button:hover::after{{opacity:.30;}}"
+                f".st-key-theme_btn_{_bi} button:hover::after{{opacity:.16;}}"
             )
         _btn_visual_css += "</style>"
         st.markdown(_btn_visual_css, unsafe_allow_html=True)
 
-        def _render_theme_btn(theme, idx):
-            label = ("**Normes & Conformité**\n\nESG, QSE & SST"
-                     if theme == "ESG, QSE & SST" else _theme_plain(theme))
-            st.button(
-                label,
-                key=f"theme_btn_{idx}",
-                on_click=_select_theme,
-                args=(theme,),
-                width="stretch",
-            )
-
         with st.container(key="theme-picker"):
-            # First in keyboard/mobile order; CSS places it in the desktop centre.
-            _featured_idx = MEDIA_SCOUT_THEMES.index("ESG, QSE & SST")
-            with st.container(key="featured-theme"):
-                _render_theme_btn(MEDIA_SCOUT_THEMES[_featured_idx], _featured_idx)
             for _idx, _theme in enumerate(MEDIA_SCOUT_THEMES):
-                if _idx != _featured_idx:
-                    _render_theme_btn(_theme, _idx)
+                _render_theme_card(_theme, _idx, signal_analysis["signals"][_theme] if signal_analysis else {},
+                                   signal_analysis.get("latest", {}).get(_theme) if signal_analysis else None)
     else:
         with st.spinner("Synthèse des signaux..."):
             start_date, end_date = date_select
-            filtered_df = media_data_df[
-                (media_data_df["Date"] >= pd.Timestamp(start_date))
-                & (media_data_df["Date"] <= pd.Timestamp(end_date))
-                & (media_data_df["Theme"].isin(selected_themes))
-            ]
+            filtered_df = _articles_for_period(date_select, selected_themes)
 
         # Veille Evenementielle : evenements a venir 12 mois a partir de start_date,
         # filtres par les themes selectionnes (catalogue statique journees + salons + congres)
@@ -2791,44 +3100,23 @@ if st.session_state.get("scout_view", "veille") == "veille":
         if filtered_df.empty and not upcoming_events:
             st.info("Aucune actualité pertinente trouvée sur la période et les thèmes sélectionnés.")
         else:
-            # ── SIGNAL DU JOUR ────────────────────────────────────────────────
+            # ── SIGNAL ────────────────────────────────────────────────────────
             # Tous les articles sont evalues avant de borner le contexte IA.
             # Le classement reserve une place a chaque veille representee.
-            _sig_con_theme = _con_theme(selected_themes)
-            _signal_candidates = filtered_df
-            if _sig_con_theme:
-                _signal_candidates = filtered_df[filtered_df.apply(
-                    lambda r: r["Veille"] != "Veille Concurrentielle"
-                    or _article_mentions_competitor(r, _sig_con_theme), axis=1
-                )] if not filtered_df.empty else filtered_df
-            _signal_pool = select_signal_candidates(_signal_candidates, selected_themes)
-            signal_articles = tuple(
-                " | ".join(
-                    part for part in [
-                        f"Titre: {str(row.get('Title', '')).strip()}",
-                        f"Source: {str(row.get('Website_name', '')).strip()}",
-                        f"Date: {_format_date_fr(row.get('Date'))}",
-                        f"Theme: {_theme_display(str(row.get('Theme', '')).strip())}",
-                        f"Veille: {_veille_display(str(row.get('Veille', '')).strip())}",
-                        f"Resume: {str(row.get('Description', '')).strip()}",
-                        f"Lien: {str(row.get('Link', '')).strip()}",
-                    ]
-                    if part and not part.endswith(": ")
-                )
-                for _, row in _signal_pool.iterrows()
-            )
-            with st.spinner("Analyse des actualités et identification du signal du jour…"):
-                signal = _session_signal(signal_articles)
+            signal = signal_analysis["signals"][selected_theme]
 
             _signal_tooltip = (
                 "Les actualités du thème et de la période sont classées selon leur pertinence, "
-                "leur impact concret pour Les Domaines Agricoles et leur fraîcheur. "
+                "leur utilité pour Les Domaines Agricoles et leur fraîcheur. "
+                "Le niveau Prioritaire met en avant un impact concret ; À la une retient une actualité "
+                "sectorielle utile, même sans urgence, ou à défaut la plus récente du thème (sans résumé). "
+                "Un extrait source peut être affiché si l'IA est indisponible. "
                 "Le Signal privilégie le Maroc, l'Union européenne et les sujets de portée mondiale. "
                 "Une actualité locale d'un pays tiers exige un lien explicite avec ce périmètre. "
                 "La zone WW d'un flux ne prouve pas une portée mondiale. "
                 "L'IA examine jusqu'à 25 candidats, avec une place réservée à chaque veille présente. "
                 "Une publication réglementaire n'est pas prioritaire par défaut. "
-                "Un Signal du jour est affiché seulement si les informations disponibles le justifient."
+                "Le niveau Prioritaire est réservé aux informations qui le justifient."
             )
 
             source_url = signal.get("source_url", "").strip()
@@ -2844,9 +3132,10 @@ if st.session_state.get("scout_view", "veille") == "veille":
                 body = escape(signal.get("body", ""))
                 cat_block = f'<span class="sep">·</span><span class="cat">{eyebrow}</span>' if eyebrow else ""
                 excerpt_label = "<strong>Extrait de l’article :</strong> " if signal.get("summary_kind") == "source_excerpt" else ""
+                signal_level_label = "Prioritaire" if signal.get("level") == "priority" else "À la une"
                 signal_html_body = (
                     '<div class="signal-eyebrow">'
-                    '<span class="badge">★ Signal du jour</span>'
+                    f'<span class="badge">★ Signal · {signal_level_label}</span>'
                     f'<span class="info-icon" title="{escape(_signal_tooltip, quote=True)}">?</span>'
                     f'{cat_block}'
                     '</div>'
@@ -2854,10 +3143,29 @@ if st.session_state.get("scout_view", "veille") == "veille":
                     f'<p>{excerpt_label}{body}</p>'
                     f'{src_block}'
                 )
-            elif signal.get("reason") == "summary_unavailable":
+            elif (latest := signal_analysis.get("latest", {}).get(selected_theme)) and not signal.get("retryable"):
+                # Dernier recours : l'actualité la plus récente, sans résumé, aussi « À la une ».
+                latest_meta = " · ".join(part for part in (latest["source"], latest["date"]) if part)
+                latest_link = (
+                    f'<a class="signal-source" href="{escape(latest["link"], quote=True)}" '
+                    f'target="_blank" rel="noopener" title="Ouvrir l\'article d\'origine">'
+                    f'🔗 Article d\'origine →</a>'
+                    if latest["link"].startswith(("https://", "http://")) else ""
+                )
                 signal_html_body = (
-                    '<div class="signal-eyebrow"><span class="badge">★ Signal du jour</span></div>'
-                    '<h2>Résumé temporairement indisponible</h2>'
+                    '<div class="signal-eyebrow">'
+                    '<span class="badge">★ Signal · À la une</span>'
+                    f'<span class="info-icon" title="{escape(_signal_tooltip, quote=True)}">?</span>'
+                    '</div>'
+                    f'<h2>{escape(latest["title"])}</h2>'
+                    f'<p>{escape(latest_meta)}</p>'
+                    f'{latest_link}'
+                )
+            elif signal.get("failure_kind") or signal.get("retryable") or signal.get("reason") in {"summary_unavailable", "source_unavailable", "insufficient_content"}:
+                unavailable_title = "Résumé temporairement indisponible" if signal.get("retryable") else "Résumé indisponible"
+                signal_html_body = (
+                    '<div class="signal-eyebrow"><span class="badge">★ Signal</span></div>'
+                    f'<h2>{unavailable_title}</h2>'
                     '<p>Le résumé de l’article n’a pas pu être généré. '
                     'Consultez sa publication d’origine.</p>'
                     f'{src_block}'
@@ -2865,16 +3173,17 @@ if st.session_state.get("scout_view", "veille") == "veille":
             else:
                 # Placeholder : cadre toujours visible meme si l'IA n'a rien retourne
                 fallback_msg = (
-                    "Aucun signal majeur n'a pu être identifié sur la période et les thèmes sélectionnés."
+                    "Les articles disponibles ne permettent pas de retenir une actualité suffisamment "
+                    "documentée dans le périmètre Maroc, UE ou mondial. Vous pouvez élargir la période."
                     if not filtered_df.empty
-                    else "Élargissez la période ou ajoutez davantage de thèmes pour faire émerger un signal du jour."
+                    else "Élargissez la période pour faire émerger un signal."
                 )
                 signal_html_body = (
                     '<div class="signal-eyebrow">'
-                    '<span class="badge">★ Signal du jour</span>'
+                    '<span class="badge">★ Signal</span>'
                     f'<span class="info-icon" title="{escape(_signal_tooltip, quote=True)}">?</span>'
                     '</div>'
-                    '<h2>Aucun signal critique détecté</h2>'
+                    '<h2>Aucune actualité à mettre en avant</h2>'
                     f'<p>{escape(fallback_msg)}</p>'
                 )
 
@@ -2901,78 +3210,54 @@ else:
     df_urls["Origine"] = df_urls["Journal"].map(get_source_origin)
     df_urls["Thème"] = df_urls["Journal"].map(MEDIA_SCOUT_FORCED_SOURCE_THEMES).map(_theme_display).fillna("Multi-thèmes")
     df_urls["Zone"] = df_urls["Journal"].map(MEDIA_SCOUT_SOURCE_ZONES).fillna("—")
+    df_urls["Journal"] = df_urls["Journal"].map(source_display_name)
+    df_urls["Couverture"] = df_urls["Couverture"].map(source_display_name)
     df_urls = df_urls.reindex(columns=["Journal", "Origine", "Thème", "Zone", "Couverture", "URL"])
-    # Priorité d'affichage : MAROC > EU > WORLD, puis Thème, puis Journal
+    # Regrouper selon l'ordre des themes du selecteur, puis les multi-themes.
+    # Dans chaque theme, conserver MAROC > EU > WORLD, puis le journal.
+    _source_themes = sorted(MEDIA_SCOUT_THEMES, key=lambda theme: theme != "ESG, QSE & SST")
+    _theme_order = {_theme_display(theme): i for i, theme in enumerate(_source_themes)}
+    df_urls["_theme_prio"] = df_urls["Thème"].map(_theme_order).fillna(len(_theme_order))
     _zone_order = {"MAROC": 0, "EU": 1, "WORLD": 2}
     df_urls["_zone_prio"] = df_urls["Zone"].map(_zone_order).fillna(99)
     df_urls = (
-        df_urls.sort_values(["_zone_prio", "Thème", "Journal"], kind="mergesort")
-        .drop(columns=["_zone_prio"])
+        df_urls.sort_values(["_theme_prio", "_zone_prio", "Journal"], kind="mergesort")
+        .drop(columns=["_theme_prio", "_zone_prio"])
         .reset_index(drop=True)
     )
 
-    # Heading + download button (right-aligned)
-    h_col1, h_col2 = st.columns([4, 1], vertical_alignment="bottom")
+    # Filtre propre au catalogue, titre et export de la selection affichee.
+    filter_col, h_col1, h_col2 = st.columns([2, 3, 1.5], vertical_alignment="bottom")
+    with filter_col:
+        source_theme_filter = st.selectbox(
+            "Thème des sources",
+            label_visibility="collapsed",
+            options=["Tous les thèmes"] + [_theme_display(theme) for theme in _source_themes] + ["Multi-thèmes"],
+            key="sources_theme_filter",
+        )
+    if source_theme_filter != "Tous les thèmes":
+        df_urls = df_urls[df_urls["Thème"] == source_theme_filter].copy()
     with h_col1:
         st.markdown(
             f"""
 <div class="sources-heading">
   Sources de référence
-  <small>{len(MEDIA_SCOUT_SOURCE_CATALOG)} sources incluses · Maroc · UE · International</small>
+  <small>{len(df_urls)} sources affichées sur {len(MEDIA_SCOUT_SOURCE_CATALOG)} · Maroc · UE · International</small>
 </div>
 """,
             unsafe_allow_html=True,
         )
     with h_col2:
-        # Generate Excel : freeze first row + autofilter + auto-fit column widths + header style
-        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-        from openpyxl.utils import get_column_letter
-
-        # Excel export : on retire la colonne Zone (gardee uniquement pour le tri/in-app)
-        df_excel = df_urls.drop(columns=["Zone"], errors="ignore")
-
-        _buf = BytesIO()
-        with pd.ExcelWriter(_buf, engine="openpyxl") as writer:
-            df_excel.to_excel(writer, sheet_name="Sources", index=False)
-            ws = writer.sheets["Sources"]
-
-            # Freeze first row (header reste visible au scroll)
-            ws.freeze_panes = "A2"
-
-            # Auto-filter sur l'ensemble du tableau
-            ws.auto_filter.ref = ws.dimensions
-
-            # Auto-fit largeurs de colonnes (max contenu + marge, plafonne a 80)
-            for col_idx, col_name in enumerate(df_excel.columns, start=1):
-                if df_excel[col_name].empty:
-                    max_len = len(str(col_name))
-                else:
-                    max_len = max(
-                        df_excel[col_name].astype(str).map(len).max(),
-                        len(str(col_name)),
-                    )
-                ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 4, 80)
-
-            # Styling header row : bold + fond papier + bordure
-            header_font = Font(bold=True, color="1A120A", size=11)
-            header_fill = PatternFill(start_color="F7F2E6", end_color="F7F2E6", fill_type="solid")
-            thin = Side(border_style="thin", color="C5A96D")
-            header_border = Border(left=thin, right=thin, top=thin, bottom=thin)
-            for cell in ws[1]:
-                cell.font = header_font
-                cell.fill = header_fill
-                cell.alignment = Alignment(horizontal="left", vertical="center")
-                cell.border = header_border
-
-            # Hauteur de la 1ere ligne (header)
-            ws.row_dimensions[1].height = 22
-
+        # La creation du fichier ne bloque plus l'ouverture de Sources.
+        df_excel = df_urls.drop(columns=["Zone"], errors="ignore").fillna("")
         st.download_button(
             label="⬇ Télécharger (Excel)",
-            data=_buf.getvalue(),
+            data=partial(sources_excel_bytes, tuple(df_excel.columns),
+                         tuple(df_excel.itertuples(index=False, name=None))),
             file_name=f"veille_ia_sources_{date.today().strftime('%Y%m%d')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="dl_sources_xlsx",
+            on_click="ignore",
             width="stretch",
         )
 
@@ -3023,3 +3308,6 @@ components.html(
     "}catch(e){}</script></body></html>",
     height=0,
 )
+
+# La collecte, les signaux et le rendu sont prêts : révéler toute l’interface.
+_loading_status.empty()

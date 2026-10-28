@@ -29,4 +29,5 @@ exports/
 cache/
 Other_Scripts/
 .claude
-tests
+# Local tests
+/tests/
