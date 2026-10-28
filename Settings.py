@@ -25,6 +25,8 @@ import streamlit as st
 from bs4 import BeautifulSoup
 from groq import Groq
 
+from azure_services import get_key_vault_secret, key_vault_enabled, load_snapshot, save_snapshot
+
 try:
     from google import genai as _genai  # SDK google-genai (>=2.x)
     from google.genai import types as _genai_types
@@ -2948,12 +2950,23 @@ def format_last_update(dt: datetime) -> str:
 
 @st.cache_data(show_spinner=False, persist="disk", max_entries=4)
 def _cached_media_scout(urls=None, slot: str = ""):
-    """Ne persiste que les collectes non vides ; les echecs restent rejouables."""
+    """Ne persiste que les collectes non vides ; les echecs restent rejouables.
+
+    Sur Azure, le resultat est aussi conserve dans Azure SQL : un redemarrage ou
+    un redeploiement reprend la collecte du creneau sans re-scraper.
+    """
+    if urls is None and slot:
+        df = load_snapshot(slot)
+        if df is not None and not df.empty and df.attrs.get("collected_at") is not None:
+            df.attrs["collection_status"] = "ok"
+            return df
     df = _collect_media_scout(urls)
     if df.empty:
         raise RuntimeError("Collection returned no usable articles")
     df.attrs["collected_at"] = _datetime_maroc()
     df.attrs["collection_status"] = "ok"
+    if urls is None and slot:
+        save_snapshot(slot, df)
     return df
 
 
@@ -3159,7 +3172,9 @@ _LLM_REQUEST_LIMIT = BoundedSemaphore(2)
 
 
 def _get_secret_or_env(name: str):
-    """Recupere une valeur depuis st.secrets en priorite, sinon os.environ."""
+    """Recupere une valeur depuis Key Vault (Azure), sinon st.secrets, sinon os.environ."""
+    if key_vault_enabled():
+        return get_key_vault_secret(name)
     try:
         v = st.secrets.get(name)
         if v:

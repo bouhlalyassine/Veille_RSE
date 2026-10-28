@@ -138,12 +138,36 @@ Après une mise à jour du projet, relancez `.\.venv\Scripts\python.exe -m pip i
 
 Le fichier de secrets local ne doit pas être envoyé dans le dépôt. Retrouvez les étapes dans les documentations officielles de [déploiement](https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/deploy) et de [gestion des secrets](https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/secrets-management).
 
+## Héberger sur Azure
+
+L'infrastructure est décrite dans `infra/main.bicep` (groupe de ressources **`RG-LDA-Veille`**) :
+
+| Ressource | Rôle |
+| --- | --- |
+| App Service Linux B1, Python 3.11 | Héberge Streamlit, avec Always On actif pour la collecte de 7 h et 19 h. |
+| Identité managée de l'app | Accès sans mot de passe à Key Vault et à Azure SQL. |
+| Key Vault (stratégies d'accès, sans RBAC) | Clés API (`GOOGLE-API-KEY`, `GROQ-API-KEY`…) et paramètres SQL. |
+| Azure SQL Basic, authentification Entra ID uniquement | Conserve le résultat de chaque collecte, réutilisé après un redémarrage. |
+
+La seule variable de l'application est `KEY_VAULT_URL`, qui n'est pas un secret. Dans Key Vault, les `_` des noms de secrets deviennent des `-`.
+
+```powershell
+az login
+winget install Microsoft.Sqlcmd
+.\infra\deploy.ps1                                  # ressources, utilisateur SQL, profil de publication GitHub
+.\infra\set-api-keys.ps1 -KeyVault <nom-du-coffre>  # saisie masquée des clés API
+```
+
+Chaque push sur `master` déclenche ensuite `.github/workflows/azure-webapp.yml`, qui déploie l'application avec le profil de publication (secret GitHub `AZURE_WEBAPP_PUBLISH_PROFILE`). Après une modification des clés dans Key Vault, redémarrez l'App Service.
+
 ## Se repérer dans le projet
 
 | Fichier | Rôle |
 | --- | --- |
 | `app.py` | Interface Streamlit, filtres, tableau de bord et affichage des sources. |
 | `Settings.py` | Sources, règles de classement, collecte, horaires, appels aux modèles IA et export Excel des sources (généré au clic puis mis en cache). |
+| `azure_services.py` | Lecture des secrets Key Vault et stockage des collectes dans Azure SQL. |
+| `infra/`, `.github/workflows/` | Infrastructure Azure et déploiement continu. |
 | `requirements.txt` | Dépendances Python de l'application. |
 | `.streamlit/config.toml` | Configuration visuelle de Streamlit. |
 | `.gitignore` | Exclusion des secrets, environnements locaux et fichiers temporaires. |
